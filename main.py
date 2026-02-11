@@ -2,8 +2,8 @@ import threading
 from urllib.parse import urlencode
 
 from config import CLIENT_ID, AUTH_URL, REDIRECT_URI, SCOPES
-from auth_server import run_server, wait_for_code
-from auth import AvitoAuth
+from tests.auth_server import run_server, wait_for_code
+from tests.auth import AvitoAuth
 
 
 def main():
