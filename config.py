@@ -1,7 +1,7 @@
 CLIENT_ID = "srXgZsiiX37LLbdGNRVf"
 CLIENT_SECRET = "Z61gVz1ZUGipJ2KA7amKTRLkZXWryWE2YllVtc42"
 
-REDIRECT_URI = "https://charitable-proprietary-half-kilometers.trycloudflare.com/callback"
+REDIRECT_URI = "http://85.239.48.132:8765/callback"
 
 SCOPES = "messenger:read messenger:write"
 

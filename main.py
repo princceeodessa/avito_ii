@@ -1,5 +1,4 @@
 import threading
-import webbrowser
 from urllib.parse import urlencode
 
 from config import CLIENT_ID, AUTH_URL, REDIRECT_URI, SCOPES
@@ -23,8 +22,10 @@ def main():
         }
 
         url = f"{AUTH_URL}?{urlencode(params)}"
-        print("➡️ Открой в браузере:", url)
-        webbrowser.open(url)
+
+        print("\nОткрой эту ссылку в браузере вручную:\n")
+        print(url)
+        print("\nЖду авторизацию...\n")
 
         code = wait_for_code()
         auth.exchange_code(code, REDIRECT_URI)
