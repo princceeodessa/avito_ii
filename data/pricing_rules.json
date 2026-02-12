@@ -1,0 +1,37 @@
+{
+  "currency": "RUB",
+  "discounts_allowed": false,
+  "final_price_allowed": false,
+  "measurement_required": true,
+  "range_deviation": 1000,
+  "cities": {
+    "Ижевск": {
+      "base_price_per_sqm": 630,
+      "extras": {
+        "светильник": 450,
+        "люстра": 500,
+        "труба": 300,
+        "карниз": 250
+      }
+    },
+    "Екатеринбург": {
+      "base_price_per_sqm": 710,
+      "extras": {
+        "светильник": 500,
+        "люстра": 550,
+        "труба": 300,
+        "карниз": 250
+      }
+    }
+  },
+  "response_rules": {
+    "use_wording": "примерная стоимость",
+    "must_offer_measurement": true,
+    "measurement_cost": "бесплатный",
+    "forbidden": [
+      "предоставлять скидки",
+      "называть точную итоговую стоимость",
+      "изменять тарифы"
+    ]
+  }
+}

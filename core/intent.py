@@ -1,13 +1,10 @@
-# core/intent.py
-
 from typing import Literal
 
 IntentType = Literal[
-    "product_question",
     "price_question",
+    "booking",
     "complaint",
-    "positive_feedback",
-    "general_question"
+    "general"
 ]
 
 
@@ -19,14 +16,13 @@ class IntentDetector:
     async def detect(self, message: str) -> IntentType:
 
         prompt = f"""
-Ты классификатор сообщений службы поддержки.
+Ты классификатор диалогов по продаже натяжных потолков.
 
 Категории:
-- product_question
-- price_question
-- complaint
-- positive_feedback
-- general_question
+- price_question (если спрашивают цену, расчет, стоимость)
+- booking (если хотят записаться на замер)
+- complaint (если недовольство)
+- general (все остальное)
 
 Ответь ТОЛЬКО названием категории.
 
@@ -37,15 +33,9 @@ class IntentDetector:
         response = await self.llm.generate(prompt)
         response = response.strip().lower().split()[0]
 
-        allowed = {
-            "product_question",
-            "price_question",
-            "complaint",
-            "positive_feedback",
-            "general_question"
-        }
+        allowed = {"price_question", "booking", "complaint", "general"}
 
         if response not in allowed:
-            return "general_question"
+            return "general"
 
         return response

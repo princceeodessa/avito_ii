@@ -1,5 +1,3 @@
-# core/prompt_builder.py
-
 from typing import Optional
 from core.router import RouteConfig
 
@@ -7,14 +5,19 @@ from core.router import RouteConfig
 class PromptBuilder:
 
     SYSTEM_BASE = """
-Ты профессиональный оператор поддержки Avito.
-Отвечай кратко, вежливо и по делу.
-Никогда не выдумывай информацию.
-Если данных недостаточно — попроси уточнение.
+Ты менеджер по продаже натяжных потолков.
+
+Правила:
+- Отвечай только на русском языке.
+- Никогда не называй итоговую точную стоимость.
+- Стоимость только ориентировочная.
+- Скидок нет.
+- Всегда предлагай бесплатный замер.
+- Будь вежливым и продающим.
 """
 
     EMPATHY_RULE = """
-Если клиент выражает недовольство:
+Если клиент недоволен:
 - извинись
 - прояви понимание
 - предложи решение
@@ -24,7 +27,9 @@ class PromptBuilder:
         self,
         message: str,
         route: RouteConfig,
-        context: Optional[str] = None
+        history: str,
+        pricing_context: Optional[str] = None,
+        promo_text: Optional[str] = None
     ) -> str:
 
         system_block = self.SYSTEM_BASE
@@ -32,19 +37,28 @@ class PromptBuilder:
         if route.use_empathy:
             system_block += "\n" + self.EMPATHY_RULE
 
-        context_block = ""
-        if context:
-            context_block = f"\nКонтекст:\n{context}\n"
+        promo_block = ""
+        if promo_text:
+            promo_block = f"\nСообщи клиенту об акции:\n{promo_text}\n"
+
+        pricing_block = ""
+        if pricing_context:
+            pricing_block = f"\nДанные для расчета:\n{pricing_context}\n"
 
         prompt = f"""
 {system_block}
 
-{context_block}
+{promo_block}
+
+История диалога:
+{history}
+
+{pricing_block}
 
 Сообщение клиента:
 {message}
 
-Ответ:
+Ответ менеджера:
 """
 
         return prompt.strip()
