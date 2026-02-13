@@ -1,106 +1,84 @@
-import asyncio
-from pathlib import Path
-
-from core.generator import ResponseGenerator
 from core.history import ChatHistory
+from core.intent import IntentDetector
+from core.extractor import extract_info
 from core.pricing import PricingEngine
 from core.promotions import PromotionManager
+from core.response import OllamaClient
 
 
-CITY_DEFAULT = "Ижевск"
-PLATFORM_DEFAULT = "avito"  # avito / vk
-
-
-class CeilingBot:
-
-    def __init__(self, model_name: str = "mistral"):
-        self.history = ChatHistory()
-        self.generator = ResponseGenerator(model_name=model_name)
-        self.pricing = PricingEngine("data/pricing_rules.json")
-        self.promotions = PromotionManager("data/promotions.json")
-
-    async def process_message(self, user_message: str, city: str, platform: str):
-
-        # 1️⃣ если первое сообщение — отправляем акцию
-        if self.history.is_empty():
-            promo = self.promotions.get_promotion(platform)
-            print(f"\n📢 Акция:\n{promo['text']}")
-            print(f"🖼 Картинка: {promo['image']}\n")
-
-        # 2️⃣ проверяем есть ли площадь
-        parsed = self.pricing.extract_data(user_message)
-
-        pricing_context = ""
-        if parsed.get("area"):
-            estimate = self.pricing.calculate_estimate(
-                city=city,
-                area=parsed["area"],
-                extras=parsed.get("extras", {})
-            )
-
-            pricing_context = f"""
-Примерный расчёт:
-Площадь: {parsed["area"]} м²
-Примерная стоимость: {estimate} руб.
-Важно: сообщи, что это ориентировочная стоимость.
-Обязательно предложи бесплатный замер.
-"""
-
-        # 3️⃣ добавляем сообщение в историю
-        self.history.add_user_message(user_message)
-
-        # 4️⃣ формируем полный контекст
-        system_context = f"""
-Ты менеджер по продаже натяжных потолков.
-
+SYSTEM_PROMPT = """Ты — менеджер по натяжным потолкам. Общайся по-русски.
 Правила:
-- Отвечай только на русском языке
-- Не давай точную итоговую стоимость
-- Стоимость только ориентировочная
-- Скидок нет
-- Всегда предлагай записаться на бесплатный замер
-- Будь вежливым и продающим
-
-{pricing_context}
+1) Не называй точную итоговую цену. Можно давать только примерный диапазон.
+2) Всегда предлагай бесплатный замер.
+3) Если пользователь не указал площадь — попроси площадь (м²) и город.
+4) Будь дружелюбным и коротким: 3–7 предложений.
+5) Если есть акция — можно упомянуть в первом ответе.
 """
 
-        full_prompt = self.history.build_prompt(system_context)
+def build_context(user_text: str, city: str, estimate, estimate_details: str, promo: str) -> str:
+    parts = []
+    parts.append(f"Город клиента: {city}")
+    if estimate.min_price is not None:
+        parts.append(f"Оценка: примерно {estimate.min_price}–{estimate.max_price} ₽ (не точная цена)")
+        if estimate_details:
+            parts.append(f"Расчёт (для себя): {estimate_details}")
+    else:
+        parts.append("Оценка: нет данных по площади")
+    if promo:
+        parts.append(f"Акция: {promo}")
+    parts.append(f"Сообщение клиента: {user_text}")
+    return "\n".join(parts)
 
-        # 5️⃣ генерируем ответ
-        response = await self.generator.generate(full_prompt)
+def main():
+    city_default = "default"
+    model = "qwen2.5:3b" # поменяй на свою модель в Ollama
+    ollama = OllamaClient(model=model)
 
-        # 6️⃣ сохраняем ответ
-        self.history.add_bot_message(response)
+    pricing = PricingEngine("data/pricing_rules.json")
+    promos = PromotionManager("data/promotions.json")
+    intents = IntentDetector()
 
-        return response
+    history = ChatHistory(SYSTEM_PROMPT, max_messages=16)
 
+    first_message = True
 
-# ==========================
-# 🧪 Консольное тестирование
-# ==========================
-
-async def main():
-    bot = CeilingBot(model_name="mistral")
-
-    city = CITY_DEFAULT
-    platform = PLATFORM_DEFAULT
-
-    print("🤖 Бот запущен. Напишите сообщение (exit для выхода)\n")
+    print("Avito AI Bot (console). Напиши сообщение клиента, 'exit' для выхода.\n")
 
     while True:
-        user_input = input("Вы: ")
-
-        if user_input.lower() in ["exit", "quit"]:
+        user_text = input("Клиент: ").strip()
+        if not user_text:
+            continue
+        if user_text.lower() in ("exit", "quit", "выход"):
             break
 
-        response = await bot.process_message(
-            user_message=user_input,
+        intent = intents.detect(user_text)
+        extracted = extract_info(user_text)
+
+        city = city_default  # пока так; позже можно извлекать город из текста
+        promo = promos.get_promo(city) if first_message else ""
+
+        estimate = pricing.calculate(city=city, area_m2=extracted.area_m2, extras=extracted.extras)
+
+        context = build_context(
+            user_text=user_text,
             city=city,
-            platform=platform
+            estimate=estimate,
+            estimate_details=estimate.details,
+            promo=promo
         )
 
-        print(f"\nБот: {response}\n")
+        # Добавляем user-message (с контекстом) в историю
+        history.add_user(context)
 
+        try:
+            answer = ollama.chat(history.to_ollama_messages())
+        except Exception as e:
+            answer = f"Ошибка генерации ответа: {e}"
+
+        history.add_assistant(answer)
+        first_message = False
+
+        print(f"\nБот: {answer}\n")
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()

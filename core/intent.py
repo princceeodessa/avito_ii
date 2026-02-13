@@ -1,41 +1,27 @@
-from typing import Literal
+import re
+from dataclasses import dataclass
 
-IntentType = Literal[
-    "price_question",
-    "booking",
-    "complaint",
-    "general"
-]
-
+@dataclass
+class IntentResult:
+    intent: str
+    confidence: float
 
 class IntentDetector:
+    PRICE = "price"
+    BOOKING = "booking"
+    COMPLAINT = "complaint"
+    GENERAL = "general"
 
-    def __init__(self, llm):
-        self.llm = llm
+    def detect(self, text: str) -> IntentResult:
+        t = text.lower()
 
-    async def detect(self, message: str) -> IntentType:
+        if re.search(r"\b(дорого|жалоб|плох|обман|верните|не\s+доволен|мошенн)\b", t):
+            return IntentResult(self.COMPLAINT, 0.85)
 
-        prompt = f"""
-Ты классификатор диалогов по продаже натяжных потолков.
+        if re.search(r"\b(сколько|цена|стоим|стоить|прайс|расч(е|ё)т|м2|кв\.?\s*м)\b", t):
+            return IntentResult(self.PRICE, 0.8)
 
-Категории:
-- price_question (если спрашивают цену, расчет, стоимость)
-- booking (если хотят записаться на замер)
-- complaint (если недовольство)
-- general (все остальное)
+        if re.search(r"\b(когда|запис|замер|приех|встреч|контакт|телефон|адрес)\b", t):
+            return IntentResult(self.BOOKING, 0.8)
 
-Ответь ТОЛЬКО названием категории.
-
-Сообщение:
-"{message}"
-"""
-
-        response = await self.llm.generate(prompt)
-        response = response.strip().lower().split()[0]
-
-        allowed = {"price_question", "booking", "complaint", "general"}
-
-        if response not in allowed:
-            return "general"
-
-        return response
+        return IntentResult(self.GENERAL, 0.6)
