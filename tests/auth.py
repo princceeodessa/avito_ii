@@ -2,7 +2,7 @@ import time
 import json
 import base64
 import requests
-from config import CLIENT_ID, CLIENT_SECRET, TOKEN_URL
+from app.config import CLIENT_ID, CLIENT_SECRET, TOKEN_URL
 
 
 class AvitoAuth:
