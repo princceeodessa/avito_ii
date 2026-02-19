@@ -47,7 +47,7 @@ class AvitoAPI:
     - authorization_code + refresh_token (если когда-нибудь понадобится)
     """
 
-    #
+
     def __init__(
         self,
         client_id: str,

@@ -85,7 +85,7 @@ def _is_incoming(m: Dict[str, Any], my_user_id: int) -> bool:
     # если нет author_id — считаем входящим (на практике хватает)
     return True
 
-#
+
 class _Debounce:
     """
     Склеиваем несколько быстрых сообщений клиента в одно (пользователи часто шлют 2-3 подряд).

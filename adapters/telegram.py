@@ -24,7 +24,7 @@ class DebouncedReply:
         self._buffers: Dict[int, List[str]] = defaultdict(list)
         self._tasks: Dict[int, asyncio.Task] = {}
 
-    #
+
     async def push(self, message: Message) -> None:
         if not message.text or not message.from_user:
             return

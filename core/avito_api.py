@@ -272,4 +272,3 @@ class AvitoAPI:
             self._http.close()
         except Exception:
             pass
-#

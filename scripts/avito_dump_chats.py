@@ -20,7 +20,6 @@ def _extract_chats_list(payload):
                 return v
     return []
 
-#
 def main():
     load_dotenv()
 
