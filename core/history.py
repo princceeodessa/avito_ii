@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import List, Dict
+from typing import List, Dict, Optional
 
 @dataclass
 class ChatMessage:
@@ -20,7 +20,6 @@ class ChatHistory:
         self._trim()
 
     def _trim(self):
-        # оставляем system + последние N сообщений
         if len(self.messages) <= 1 + self.max_messages:
             return
         system = self.messages[0]
@@ -29,3 +28,14 @@ class ChatHistory:
 
     def to_ollama_messages(self) -> List[Dict[str, str]]:
         return [{"role": m.role, "content": m.content} for m in self.messages]
+
+    def to_ollama_messages_with_context(self, context: str) -> List[Dict[str, str]]:
+        """
+        Возвращает messages для LLM, добавляя временное system-сообщение с фактами.
+        ВАЖНО: context не сохраняется в истории.
+        """
+        msgs = self.to_ollama_messages()
+        if context:
+            # system prompt уже есть, поэтому вставляем вторым system-сообщением
+            msgs.insert(1, {"role": "system", "content": context})
+        return msgs
