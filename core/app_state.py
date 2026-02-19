@@ -2,6 +2,7 @@
 import asyncio
 import re
 import time
+import datetime
 from difflib import SequenceMatcher
 from typing import Optional, Dict, Any, List, Callable, Awaitable
 
@@ -18,17 +19,20 @@ from core.response import OllamaClient
 
 SYSTEM_PROMPT = """Ты — менеджер по натяжным потолкам. Общайся по-русски.
 
+ЖЁСТКИЕ ПРАВИЛА:
+- НЕ придумывай имена клиентов и не обращайся по имени, если клиент сам не представился.
+- НЕ придумывай телефоны/контакты компании и НЕ пиши "позвоните по номеру".
+- НЕ говори "мы ждём вас", "приходите". Только: "мастер приедет", "диспетчер подтвердит".
+- НЕ говори "я приеду/я проведу замер". Ты оформляешь заявку.
+
 Правила:
-1) НЕ называй точную итоговую цену. Только примерный диапазон.
+1) НЕ называй точную итоговую цену. Только ориентир: ‘от N ₽’ (без ‘до’).
 2) Замер ВСЕГДА бесплатный. Замерщик приезжает с каталогами и примерами работ.
-3) Если нет площади — попроси площадь (м²) и город.
-4) Будь дружелюбным и коротким: 3–7 предложений.
+3) Для расчёта нужны город + площадь. Телефон для расчёта НЕ обязателен.
+4) Коротко и вежливо: 3–7 предложений.
 5) Если есть акция — можно упомянуть в первом ответе.
-6) НИКОГДА не говори, что ты лично приедешь или "ждёшь клиента". Ты оформляешь заявку, мастер/диспетчер подтвердит.
-7) Для замера ОБЯЗАТЕЛЬНО собери: город, адрес, телефон, дату и время.
-8) Не здоровайся повторно, если диалог уже начался.
-9) Если клиент спросил "сколько стоит замер" — отвечай: замер бесплатный.
-10) Если клиент спросил цену: в первый раз вежливо предложи замер, при повторе — можно дать примерный диапазон.
+6) Для замера собери: город, адрес, телефон, дату и время.
+7) Не здоровайся повторно, если диалог уже начался.
 """
 
 
@@ -92,11 +96,11 @@ NORM_CITIES = [(city, _norm_phrase(city)) for city in SUPPORTED_CITIES]
 
 
 def extract_city(text: str) -> Optional[str]:
-    tlow = text.lower()
+    tlow = (text or "").lower()
     if re.search(r"(?<!\w)екб(?!\w)", tlow):
         return "Екатеринбург"
 
-    tnorm = _norm_phrase(text)
+    tnorm = _norm_phrase(text or "")
     if not tnorm:
         return None
 
@@ -123,21 +127,42 @@ def extract_city(text: str) -> Optional[str]:
     return None
 
 
+# ------------------- discounts -------------------
+
+DISCOUNT_RE = re.compile(
+    r"\b(скидк\w*|акци\w*|подар\w*|промокод\w*|купон\w*|бонус\w*|распродаж\w*)\b",
+    re.IGNORECASE
+)
+
+PROMO_DISCOUNTS_TEXT = (
+    "На каждый второй потолок (меньший по площади) полотно идет в подарок😇🌸\n"
+    "Если кто-то из ваших близких участник СВО или работник оборонного предприятия, то и 3е полотно будет в подарок! 🥰\n"
+    "Также скидка на освещение будет от нашего отдела до 50% 😊\n\n"
+    "Все индивидуальные предложения специалист рассмотрит с Вами по месту ☀️📝"
+)
+
+
+def detect_discount_mention(text: str) -> bool:
+    return bool(DISCOUNT_RE.search(text or ""))
+
+
 # ------------------- parsing helpers -------------------
 
-PHONE_RE = re.compile(r"(\+7|8)\s*\(?\d{3}\)?[\s\-]*\d{3}[\s\-]*\d{2}[\s\-]*\d{2}")
-AREA_HINT_RE = re.compile(r"\b(кв\.?\s?м|квм|м2|м²)\b", re.IGNORECASE)
+PHONE_RE = re.compile(r"(?<!\d)(?:\+7|7|8)\s*\(?\d{3}\)?[\s\-]*\d{3}[\s\-]*\d{2}[\s\-]*\d{2}(?!\d)")
+PHONE_ANY_RE = re.compile(r"(?<!\d)(?:\+?\d[\d\-\s\(\)]{8,}\d)(?!\d)")
 
-ADDRESS_RE = re.compile(r"([А-ЯЁA-Zа-яёa-z\-\s]{3,})\s+(\d{1,4}[а-яa-z]?)", re.IGNORECASE)
+AREA_HINT_RE = re.compile(r"\b(кв\.?\s?м|квм|м2|м²|квадрат\w*|площад\w*)\b", re.IGNORECASE)
+
+ADDRESS_RE = re.compile(r"([А-ЯЁA-Zа-яёa-z\-\s\.,]{3,})\s+(\d{1,4}[а-яa-z]?)", re.IGNORECASE)
 ADDRESS_HINT_RE = re.compile(
     r"\b(адрес|ул\.?|улиц\w*|пр\-?т|проспект\w*|пер\.?|переулок\w*|шоссе|бульвар\w*|площад\w*|"
     r"дом|д\.|кв\.|квартира|корпус|стр\.|строен\w*|подъезд|этаж)\b",
     re.IGNORECASE
 )
 
-TIME_HHMM_RE = re.compile(r"\b([01]?\d|2[0-3]):\d{2}\b")
-TIME_H_RE = re.compile(r"\bв\s*([01]?\d|2[0-3])\b")
-TIME_WORD_RE = re.compile(r"\bв\s*час\b", re.IGNORECASE)
+TIME_HHMM_RE = re.compile(r"\b([01]?\d|2[0-3])[:.]\d{2}\b")
+TIME_PLAIN_H_RE = re.compile(r"^\s*([01]?\d|2[0-3])\s*$")
+TIME_H_RE = re.compile(r"\bв\s*([01]?\d|2[0-3])\b", re.IGNORECASE)
 
 DATE_NUM_RE = re.compile(r"\b(\d{1,2})[./](\d{1,2})(?:[./](\d{2,4}))?\b")
 MONTHS = (
@@ -146,201 +171,301 @@ MONTHS = (
 )
 DATE_WORD_RE = re.compile(r"\b(\d{1,2})\s+(" + "|".join(MONTHS) + r")\b", re.IGNORECASE)
 
+MEASURE_DECLINE_RE = re.compile(
+    r"\b(без\s+замер\w*|замер\s+не\s+нужен|не\s+нужен\s+замер|не\s+надо\s+замер\w*|"
+    r"не\s+хочу\s+замер\w*|не\s+приезжайте|без\s+выезда)\b",
+    re.IGNORECASE
+)
+
+CALC_ONLY_RE = re.compile(
+    r"\b(без\s+замер\w*|просто\s+(посчит|счит|просчит|рассчит)|только\s+расчет|только\s+расч[её]т|"
+    r"предварит\w*\s+расчет|предварит\w*\s+расч[её]т)\b",
+    re.IGNORECASE
+)
+
+PHONE_REFUSAL_RE = re.compile(
+    r"\b(номер\s+не\s+хочу|не\s+хочу\s+оставлять|без\s+номера|не\s+оставлю|не\s+буду\s+оставлять|"
+    r"не\s+звоните|звонить\s+не\s+надо|без\s+звонков|не\s+нужно\s+звонить)\b",
+    re.IGNORECASE
+)
+
+AFFIRM_RE = re.compile(r"\b(да|давайте|ок|хорошо|можно|запишите|записывайте|хочу|согласен|согласна)\b", re.IGNORECASE)
+NEG_RE = re.compile(r"\b(нет|не\s*надо|не\s*нужно|потом|позже)\b", re.IGNORECASE)
+
+MEASURE_BOOK_TRIG_RE = re.compile(
+    r"\b(запиш|записат|давайте\s+замер|на\s+замер|выехать|когда\s+сможете|когда\s+приедете|"
+    r"завтра\s+можете|сегодня\s+можете)\b",
+    re.IGNORECASE
+)
+
+MEASURE_INFO_TRIG_RE = re.compile(
+    r"\b(выезжа\w*|приезжа\w*|делаете\s+замер|замер\s+бесплат\w*|сколько\s+стоит\s+замер)\b",
+    re.IGNORECASE
+)
+
+
+def detect_affirm(text: str) -> bool:
+    return bool(AFFIRM_RE.search(text or "")) and not bool(re.search(r"\bне\b", (text or "").lower()))
+
+
+def detect_neg(text: str) -> bool:
+    return bool(NEG_RE.search(text or ""))
+
+
+def detect_measurement_decline(text: str) -> bool:
+    return bool(MEASURE_DECLINE_RE.search(text or ""))
+
+
+def detect_calc_only(text: str) -> bool:
+    return bool(CALC_ONLY_RE.search(text or ""))
+
+
+def detect_phone_refusal(text: str) -> bool:
+    return bool(PHONE_REFUSAL_RE.search(text or ""))
+
+
+def detect_measurement_booking_intent(text: str) -> bool:
+    if detect_measurement_decline(text):
+        return False
+    return bool(MEASURE_BOOK_TRIG_RE.search(text or ""))
+
+
+def detect_measurement_info_question(text: str) -> bool:
+    if detect_measurement_decline(text):
+        return False
+    return bool(MEASURE_INFO_TRIG_RE.search(text or ""))
+
+
+def detect_measurement_cost_question(text: str) -> bool:
+    low = (text or "").lower()
+    return ("сколько стоит замер" in low) or ("замер бесплат" in low) or ("это бесплатно" in low)
+
+
+def detect_price_question(text: str) -> bool:
+    low = (text or "").lower()
+    triggers = [
+        "сколько стоит", "стоимость", "цена", "по чем", "почем",
+        "просчитать", "рассчитать", "посчитать", "посчитайте",
+        "примерно", "ориентир", "сколько выйдет", "предварительно"
+    ]
+    return any(t in low for t in triggers)
+
 
 def extract_phone(text: str) -> Optional[str]:
-    m = PHONE_RE.search(text)
+    m = PHONE_RE.search(text or "")
     if not m:
         return None
-    phone = re.sub(r"[^\d+]", "", m.group(0))
-    if phone.startswith("8") and len(phone) == 11:
-        phone = "+7" + phone[1:]
-    return phone
+    digits = re.sub(r"\D", "", m.group(0))
+    if len(digits) == 11 and digits.startswith("8"):
+        digits = "7" + digits[1:]
+    if len(digits) == 11 and digits.startswith("7"):
+        return "+" + digits
+    return None
 
 
 def extract_address(text: str) -> Optional[str]:
-    t = text.strip()
+    t = (text or "").strip()
     if not t:
         return None
 
     low = t.lower()
 
-    # защита: дата/время => не адрес
+    # дата/время => не адрес
     if TIME_HHMM_RE.search(t) or DATE_NUM_RE.search(t) or DATE_WORD_RE.search(low):
         return None
-    if "завтра" in low or "сегодня" in low or "после" in low:
-        return None
 
+    # площадь => не адрес
     if AREA_HINT_RE.search(t):
         return None
 
-    if ADDRESS_HINT_RE.search(t):
-        return t
+    # есть маркер адреса, но нет цифр — не берём
+    if ADDRESS_HINT_RE.search(t) and not re.search(r"\d", t):
+        return None
 
     m = ADDRESS_RE.search(t)
-    if m and len(t) <= 70:
-        street = m.group(1).strip().lower()
-        house = m.group(2).strip()
-
+    if m:
+        street = m.group(1).strip().lower().strip(" ,.-")
         if street in ("в", "во", "на", "к", "ко"):
             return None
-
-        # дом <= 31 без маркеров адреса часто путается с датой
-        try:
-            hn = int(re.sub(r"\D", "", house))
-            if hn <= 31 and not ADDRESS_HINT_RE.search(t):
-                return None
-        except Exception:
-            pass
-
-        return t
+        return t.strip()
 
     return None
 
 
 def extract_visit_time(text: str) -> Optional[str]:
-    low = text.lower()
+    low = (text or "").lower()
 
-    m = TIME_HHMM_RE.search(text)
+    m = TIME_HHMM_RE.search(text or "")
     if m:
-        return m.group(0)
+        return m.group(0).replace(".", ":")
 
-    m = TIME_H_RE.search(text)
+    m = TIME_PLAIN_H_RE.match((text or "").strip())
     if m:
         hh = int(m.group(1))
+        if hh <= 7 and ("утра" not in low) and ("ноч" not in low):
+            hh += 12
         return f"{hh:02d}:00"
 
-    if TIME_WORD_RE.search(text):
-        return "в час"
+    m = TIME_H_RE.search(text or "")
+    if m:
+        hh = int(m.group(1))
+        if hh <= 7 and ("утра" not in low) and ("ноч" not in low):
+            hh += 12
+        return f"{hh:02d}:00"
 
+    if "обед" in low:
+        return "обед"
+    if "утром" in low:
+        return "утром"
     if "днем" in low or "днём" in low:
         return "днем"
     if "вечером" in low:
         return "вечером"
 
-    if "после" in low:
-        return text.strip()
-
     return None
 
 
 def extract_visit_date(text: str) -> Optional[str]:
-    low = text.lower()
+    low = (text or "").lower()
     if "сегодня" in low:
         return "сегодня"
     if "завтра" in low:
         return "завтра"
 
-    m = DATE_NUM_RE.search(text)
+    m = DATE_NUM_RE.search(text or "")
     if m:
         dd, mm, yy = m.group(1), m.group(2), m.group(3)
         if yy:
             return f"{dd}.{mm}.{yy}"
         return f"{dd}.{mm}"
 
-    m = DATE_WORD_RE.search(text)
+    m = DATE_WORD_RE.search(low)
     if m:
         return f"{m.group(1)} {m.group(2)}"
 
     return None
 
 
-def detect_measurement_interest(text: str) -> bool:
-    low = text.lower()
-    triggers = [
-        "на замер", "замер", "выезд", "когда сможете", "когда приедете",
-        "можете приехать", "давайте замер", "запишите", "записаться",
-        "сколько стоит замер", "это бесплатно", "бесплатный замер"
-    ]
-    return any(t in low for t in triggers)
+def resolve_relative_date(vdate: str) -> str:
+    if not vdate:
+        return vdate
+    today = datetime.date.today()
+    if vdate == "сегодня":
+        return today.strftime("%d.%m.%Y")
+    if vdate == "завтра":
+        return (today + datetime.timedelta(days=1)).strftime("%d.%m.%Y")
+    return vdate
 
 
-def detect_measurement_cost_question(text: str) -> bool:
-    low = text.lower()
-    return ("сколько стоит замер" in low) or ("это бесплатно" in low) or ("замер бесплатный" in low)
-
-
-def detect_price_question(text: str) -> bool:
-    low = text.lower()
-    triggers = [
-        "сколько стоит", "стоимость", "цена", "по чем", "почем",
-        "просчитать", "рассчитать", "примерно выйдет", "бюджет"
-    ]
-    return any(t in low for t in triggers)
-
-
-def needs_city_now(text: str) -> bool:
-    return detect_price_question(text) or detect_measurement_interest(text)
-
-
-# ------------------- greeting sanitizer -------------------
+# ------------------- sanitizer -------------------
 
 GREET_RE = re.compile(
     r"^\s*(здравствуйте|добрый день|добрый вечер|доброе утро|привет|приветствую)[\s!\.,:;-]*",
     re.IGNORECASE
 )
 
+BAD_WAIT_RE = re.compile(r"(?i)\b(жд[её]м\s+вас|приходите|ожидаем\s+вас|встреча\s+ждет|встреча\s+жд[её]т)\b")
+BAD_I_RE = re.compile(r"(?i)\bя\s+(приеду|выех\w*|проведу\s+замер|замерю)\b")
+BAD_CALL_RE = re.compile(r"(?i)\b(позвоню|позвоним|созвон|позвоните|звоните|наберите)\b[^\n]*")
+BAD_WE_MASTER_RE = re.compile(r"(?i)\bмы\s+мастер\b")
+BAD_SOON_RE = re.compile(r"(?i)\bскоро\s+отвечу\b")
 
-def sanitize_answer(answer: str, allow_greet: bool) -> str:
+
+def sanitize_answer(answer: str, allow_greet: bool, allow_phone_echo: bool = False) -> str:
     if not answer:
         return answer
-    if allow_greet:
-        return answer.strip()
-    answer = GREET_RE.sub("", answer, count=1)
-    return answer.strip()
+    s = answer.strip()
+
+    if not allow_greet:
+        s = GREET_RE.sub("", s, count=1).strip()
+
+    s = BAD_WE_MASTER_RE.sub("мастер", s)
+    s = BAD_WAIT_RE.sub("мастер приедет", s)
+    s = BAD_I_RE.sub("мастер приедет", s)
+    s = BAD_SOON_RE.sub("", s)
+
+    # убрать любые "позвоню/позвоните..." — чтобы не было выдуманного созвона
+    s = BAD_CALL_RE.sub("", s).strip()
+
+    # убрать любые телефоны из ответа (кроме подтверждения лида)
+    if not allow_phone_echo:
+        s = PHONE_ANY_RE.sub("", s)
+
+    s = re.sub(r"[ \t]{2,}", " ", s)
+    s = re.sub(r"\n{3,}", "\n\n", s).strip()
+    return s
 
 
 # ------------------- text builders -------------------
 
-def build_measurement_pitch() -> str:
+def t_hello(first: bool) -> str:
+    return "Здравствуйте! " if first else ""
+
+
+def build_welcome(first: bool) -> str:
     return (
-        "Замер у нас бесплатный ✅\n"
-        "Замерщик выезжает с каталогами и примерами работ — подберём материал и цвет под ваш бюджет.\n"
+        f"{t_hello(first)}Будем рады помочь 😊\n"
+        "Подскажите, пожалуйста, ваш город и примерную площадь (м²).\n"
+        "Замер бесплатный — мастер приедет с каталогами и образцами."
+    )
+
+
+def build_need_city(first: bool) -> str:
+    return f"{t_hello(first)}Подскажите, пожалуйста, в каком вы городе?"
+
+
+def build_need_area(first: bool, city: str) -> str:
+    return (
+        f"{t_hello(first)}{city} — понял(а).\n"
+        "Чтобы назвать ориентир по стоимости, подскажите площадь (м²). Можно примерно."
+    )
+
+
+def build_discounts_message(first: bool, city: Optional[str]) -> str:
+    city_line = f"В {city} работаем.\n" if city else ""
+    return (
+        f"{t_hello(first)}{city_line}"
+        "У нас сейчас есть такие скидки:\n\n"
+        f"{PROMO_DISCOUNTS_TEXT}\n\n"
+        "Если хотите — подскажите город и площадь (м²), сориентирую по стоимости.\n"
+        "Замер бесплатный — мастер приедет с каталогами и образцами."
+    )
+
+
+def build_estimate(min_price: int) -> str:
+    return (
+        f"Ориентир по стоимости: от {min_price} ₽ ✅\n"
+        "Точная цена зависит от углов, светильников и выбранного профиля/материала.\n"
+        "Если захотите уточнить точнее — замер бесплатный: мастер приедет с каталогами и образцами. Записать вас?"
+    )
+
+
+def build_measure_info(first: bool, city: str) -> str:
+    return (
+        f"{t_hello(first)}В {city} выезжаем.\n"
+        "Замер бесплатный ✅ Мастер приедет с каталогами и образцами.\n"
         "Если хотите — запишу на удобные дату и время."
     )
 
 
-def build_lead_confirmation(mem: Dict[str, Any]) -> str:
+def build_measure_intro(first: bool) -> str:
     return (
-        "Ваша заявка на замер принята!\n\n"
-        f"Город: {mem.get('city')}\n"
-        f"Адрес: {mem.get('address')}\n"
-        f"Телефон: {mem.get('phone')}\n"
-        f"Удобное время для замера: {mem.get('visit_date')} в {mem.get('visit_time')}\n\n"
-        "Замер бесплатный. Мастер приедет с каталогами и примерами работ.\n"
-        "Мастер/диспетчер подтвердит все детали. Благодарю за сотрудничество!"
+        f"{t_hello(first)}Отлично, оформим бесплатный замер ✅\n"
+        "Мастер приедет с каталогами и образцами. Уточню один момент:"
     )
 
 
-def build_context(user_text: str, estimate, estimate_details: str, promo: str, mem: Dict[str, Any]) -> str:
-    parts = [f"Город клиента: {mem.get('city')}"]
-
-    if mem.get("area_m2"):
-        parts.append(f"Площадь (из памяти): {mem['area_m2']} м²")
-    if mem.get("areas"):
-        parts.append(f"Площади помещений (из памяти): {mem['areas']}")
-    if mem.get("extras"):
-        parts.append(f"Допы (из памяти): {mem['extras']}")
-    if mem.get("visit_date"):
-        parts.append(f"Дата замера (из памяти): {mem['visit_date']}")
-    if mem.get("visit_time"):
-        parts.append(f"Время замера (из памяти): {mem['visit_time']}")
-    if mem.get("address"):
-        parts.append(f"Адрес (из памяти): {mem['address']}")
-    if mem.get("phone"):
-        parts.append(f"Телефон (из памяти): {mem['phone']}")
-
-    if getattr(estimate, "min_price", None) is not None:
-        parts.append(f"Оценка: примерно {estimate.min_price}–{estimate.max_price} ₽ (не точная цена)")
-        if estimate_details:
-            parts.append(f"Расчёт (для себя): {estimate_details}")
-    else:
-        parts.append("Оценка: нет данных по площади")
-
-    if promo:
-        parts.append(f"Акция: {promo}")
-
-    parts.append(f"Сообщение клиента: {user_text}")
-    return "\n".join(parts)
+def build_lead_confirmation(mem: Dict[str, Any]) -> str:
+    vdate = resolve_relative_date(mem.get("visit_date") or "")
+    vtime = mem.get("visit_time") or "-"
+    return (
+        "Спасибо! Заявка на бесплатный замер принята ✅\n\n"
+        f"Город: {mem.get('city')}\n"
+        f"Адрес: {mem.get('address')}\n"
+        f"Телефон: {mem.get('phone')}\n"
+        f"Дата и время: {vdate} в {vtime}\n\n"
+        "Мастер/диспетчер подтвердит детали. Если нужно поменять время — просто напишите."
+    )
 
 
 # ------------------- AppState -------------------
@@ -353,6 +478,7 @@ class AppState:
     Единое ядро: память + история + лиды + LLM.
     Адаптеры (tg/vk/avito/max) просто вызывают generate_reply().
     """
+
     def __init__(self, model: str, ollama_timeout: int = 240):
         self.ollama_timeout = ollama_timeout
         self.ollama = OllamaClient(model=model)
@@ -367,11 +493,9 @@ class AppState:
         self.mem_store = FileKVStore(dir_path="data/memory")
         self.leads = LeadStoreTxt(path="data/leads.txt")
 
-        # мгновенная отправка в TG колл-центра (из to_thread)
         self._loop = None
         self._notify_coro = None
 
-        # мгновенная отправка email (из to_thread)
         self._email_loop = None
         self._email_sender: Optional[EmailSender] = None
 
@@ -397,10 +521,6 @@ class AppState:
         self._email_sender = email_sender
 
     def send_email_now(self, subject: str, body: str, file_path: str) -> None:
-        """
-        Вызывается из потока (generate_reply -> to_thread),
-        поэтому планируем async-отправку в основном loop.
-        """
         if not self._email_loop or not self._email_sender:
             return
         if not file_path:
@@ -429,105 +549,56 @@ class AppState:
         self.first_message[k] = True
         self.mem_store.reset(k)
 
-    # ---------- lead flow ----------
-
-    def _ask_missing(self, mem: Dict[str, Any], missing: List[str]) -> str:
-        asked_key_map = {
-            "город": "asked_city",
-            "адрес": "asked_address",
-            "телефон": "asked_phone",
-            "дата": "asked_date",
-            "время": "asked_time",
-        }
-
-        lines = [
-            "Отлично, запишу на бесплатный замер ✅",
-            "Замер бесплатный, мастер приедет с каталогами и примерами работ."
-        ]
-
-        for item in missing:
-            asked_key = asked_key_map.get(item)
-            asked_before = bool(mem.get(asked_key)) if asked_key else False
-
-            if item == "город":
-                lines.append(
-                    "Уточните город, пожалуйста — чтобы правильно оформить заявку."
-                    if asked_before else
-                    "В каком вы городе?"
-                )
-                mem["asked_city"] = True
-
-            elif item == "адрес":
-                lines.append(
-                    "Напишите адрес ещё раз, пожалуйста (улица, дом, квартира)."
-                    if asked_before else
-                    "Подскажите адрес (улица, дом, квартира)."
-                )
-                mem["asked_address"] = True
-
-            elif item == "телефон":
-                lines.append(
-                    "Пожалуйста, напишите номер телефона — без него не смогу оформить заявку."
-                    if asked_before else
-                    "Уточните номер телефона для подтверждения заявки."
-                )
-                mem["asked_phone"] = True
-
-            elif item == "дата":
-                lines.append(
-                    "Нужна дата замера (например: 16 февраля или 16.02). Напишите, пожалуйста."
-                    if asked_before else
-                    "На какую дату записываем замер? (например: 16 февраля или 16.02)"
-                )
-                mem["asked_date"] = True
-
-            elif item == "время":
-                lines.append(
-                    "И ещё время (например: 16:00). Напишите, пожалуйста."
-                    if asked_before else
-                    "Какое удобное время? (например: 16:00)"
-                )
-                mem["asked_time"] = True
-
-        return "\n".join(lines)
+    # ---------- lead helpers ----------
 
     def _get_lead_file_path(self, append_result) -> str:
-        """
-        Пытаемся получить путь к сформированному txt-файлу лида.
-        Совместимо с разными версиями LeadStoreTxt.
-        """
         if isinstance(append_result, str) and append_result:
             return append_result
-
-        # часто делают атрибуты типа last_path
         for attr in ("last_path", "last_file_path", "last_filename", "last_file"):
             p = getattr(self.leads, attr, None)
             if isinstance(p, str) and p:
                 return p
+        return ""
+
+    def _ask_next_measure_field(self, mem: Dict[str, Any], first: bool) -> str:
+        """
+        Спрашиваем по ОДНОМУ полю.
+        Порядок: город -> адрес -> дата -> время -> телефон
+        """
+        if not mem.get("city"):
+            mem["asked_city"] = True
+            return build_need_city(first)
+
+        intro = build_measure_intro(first) if not mem.get("measure_intro_sent") else "Спасибо! Уточню ещё один момент:"
+        mem["measure_intro_sent"] = True
+
+        if not mem.get("address"):
+            mem["asked_address"] = True
+            return f"{intro}\nНапишите, пожалуйста, адрес (улица, дом, квартира/офис)."
+
+        if not mem.get("visit_date"):
+            mem["asked_date"] = True
+            return f"{intro}\nНа какую дату удобно? (например: 19.02 или 19 февраля)"
+
+        vt = mem.get("visit_time")
+        if not vt or vt in ("обед", "утром", "днем", "вечером"):
+            mem["asked_time"] = True
+            return f"{intro}\nКакое точное время удобно? (например: 13:00)"
+
+        if not mem.get("phone"):
+            mem["asked_phone"] = True
+            return f"{intro}\nИ номер телефона для подтверждения заявки (можно 8XXXXXXXXXX)."
 
         return ""
 
-    def _maybe_create_lead_if_ready(self, platform: str, user_id: str, mem: Dict[str, Any], meta: Dict[str, Any]) -> Optional[str]:
+    def _maybe_create_measure_lead_if_ready(self, platform: str, user_id: str, mem: Dict[str, Any], meta: Dict[str, Any], first: bool) -> Optional[str]:
         if not mem.get("agreed_measurement"):
             return None
         if mem.get("lead_created"):
             return None
 
-        missing: List[str] = []
-        if not mem.get("city"):
-            missing.append("город")
-        if not mem.get("address"):
-            missing.append("адрес")
-        if not mem.get("phone"):
-            missing.append("телефон")
-        if not mem.get("visit_date"):
-            missing.append("дата")
-        if not mem.get("visit_time"):
-            missing.append("время")
-
-        if missing:
-            msg = self._ask_missing(mem, missing)
-            # важно: сохранить флаги asked_* чтобы формулировки менялись
+        msg = self._ask_next_measure_field(mem, first=first)
+        if msg:
             self.mem_store.save(self._key(platform, user_id), mem)
             return msg
 
@@ -537,23 +608,23 @@ class AppState:
             "user_id": user_id,
             "username": meta.get("username", ""),
             "name": meta.get("name", ""),
+            "lead_kind": "measure",
             "city": mem.get("city"),
             "area_m2": mem.get("area_m2"),
             "areas": mem.get("areas"),
             "extras": mem.get("extras"),
             "address": mem.get("address"),
-            "visit_date": mem.get("visit_date"),
+            "visit_date": resolve_relative_date(mem.get("visit_date") or ""),
             "visit_time": mem.get("visit_time"),
             "phone": mem.get("phone"),
         }
 
-        append_result = self.leads.append(lead)  # может вернуть путь к файлу
+        append_result = self.leads.append(lead)
         lead_file_path = self._get_lead_file_path(append_result)
 
         mem["lead_created"] = True
         self.mem_store.save(self._key(platform, user_id), mem)
 
-        # --- уведомление в TG колл-центра ---
         uname = f"@{lead['username']}" if lead.get("username") else "-"
         lead_text = (
             "🆕 Новая заявка на бесплатный замер\n"
@@ -566,12 +637,11 @@ class AppState:
             f"Дата: {lead.get('visit_date') or '-'}\n"
             f"Время: {lead.get('visit_time') or '-'}\n"
             f"Телефон: {lead.get('phone') or '-'}\n"
-            f"Площади: {lead.get('areas') or lead.get('area_m2') or '-'}\n"
+            f"Площадь: {lead.get('area_m2') or lead.get('areas') or '-'}\n"
             f"Допы: {lead.get('extras') or '-'}"
         )
         self.notify_now(lead_text)
 
-        # --- email: отправляем файл и чистим его внутри email_sender ---
         if lead_file_path:
             subject = f"Заявка на замер: {lead.get('city')} / {lead.get('visit_date')} {lead.get('visit_time')}"
             body = lead_text + "\n\nФайл заявки во вложении."
@@ -579,10 +649,58 @@ class AppState:
 
         return build_lead_confirmation(mem)
 
-    # ---------- LLM call ----------
+    def _maybe_create_hot_refusal_lead(self, platform: str, user_id: str, mem: Dict[str, Any], meta: Dict[str, Any]) -> None:
+        """
+        Горячий лид: отказ от замера, но интерес к цене/расчёту. Телефон НЕ обязателен.
+        """
+        if not mem.get("hot_refusal_lead"):
+            return
+        if mem.get("hot_refusal_lead_created"):
+            return
+        if not mem.get("city") or not mem.get("area_m2"):
+            return
 
-    def _ollama_chat(self, msgs):
-        return self.ollama.chat(msgs)
+        lead = {
+            "ts": int(time.time()),
+            "platform": platform,
+            "user_id": user_id,
+            "username": meta.get("username", ""),
+            "name": meta.get("name", ""),
+            "lead_kind": "hot_refusal",
+            "status": "refused_measurement_high_interest",
+            "city": mem.get("city"),
+            "area_m2": mem.get("area_m2"),
+            "extras": mem.get("extras"),
+            "phone": mem.get("phone"),
+            "note": "Клиент отказался от замера, но просил ориентир/расчёт.",
+        }
+
+        append_result = self.leads.append(lead)
+        lead_file_path = self._get_lead_file_path(append_result)
+
+        mem["hot_refusal_lead_created"] = True
+        self.mem_store.save(self._key(platform, user_id), mem)
+
+        uname = f"@{lead['username']}" if lead.get("username") else "-"
+        phone_txt = lead.get("phone") or "не оставил"
+        lead_text = (
+            "🔥 Горячий интерес (без замера)\n"
+            f"Платформа: {lead['platform']}\n"
+            f"User ID: {lead['user_id']}\n"
+            f"Username: {uname}\n"
+            f"Имя: {lead.get('name') or '-'}\n"
+            f"Город: {lead.get('city') or '-'}\n"
+            f"Телефон: {phone_txt}\n"
+            f"Площадь: {lead.get('area_m2') or '-'}\n"
+            f"Допы: {lead.get('extras') or '-'}\n"
+            f"Комментарий: {lead.get('note')}"
+        )
+        self.notify_now(lead_text)
+
+        if lead_file_path:
+            subject = f"Горячий лид (без замера): {lead.get('city')} / {phone_txt}"
+            body = lead_text + "\n\nФайл заявки во вложении."
+            self.send_email_now(subject, body, lead_file_path)
 
     # ---------- public API ----------
 
@@ -590,117 +708,187 @@ class AppState:
         meta = meta or {}
         history = self.get_history(platform, user_id)
         k = self._key(platform, user_id)
+        first = bool(self.first_message.get(k, True))
 
         mem: Dict[str, Any] = self.mem_store.load(k)
 
-        _intent = self.intents.detect(user_text)
+        # --- извлечение ---
         extracted = extract_info(user_text)
 
-        # --- площади ---
         if getattr(extracted, "area_m2", None):
             mem["area_m2"] = extracted.area_m2
-
-        nums = re.findall(r"\b(\d{1,3})\b", user_text)
-        if "и" in user_text and len(nums) >= 2:
-            areas = [int(n) for n in nums if int(n) >= 10]
-            if len(areas) >= 2:
-                mem["areas"] = areas[:5]
-                mem["area_m2"] = sum(areas[:5])
-
         if getattr(extracted, "extras", None):
             mem["extras"] = extracted.extras
 
-        # --- город/телефон/адрес/дата/время ---
-        c = extract_city(user_text)
-        if c and c != mem.get("city"):
+        # доп. эвристика площади: ловим число даже без "кв.м"
+        cleaned = PHONE_ANY_RE.sub(" ", user_text or "")
+        nums = [int(n) for n in re.findall(r"\b(\d{1,3})\b", cleaned)]
+        nums = [n for n in nums if 1 <= n <= 300]
+        if nums and (AREA_HINT_RE.search(cleaned) or detect_price_question(cleaned) or mem.get("asked_area")):
+            mem["area_m2"] = float(max(nums))
+
+        c = extract_city(user_text or "")
+        if c:
             mem["city"] = c
 
-        ph = extract_phone(user_text)
+        if detect_phone_refusal(user_text or ""):
+            mem["no_phone"] = True
+        ph = extract_phone(user_text or "")
         if ph:
             mem["phone"] = ph
+            mem.pop("no_phone", None)
 
-        addr = extract_address(user_text)
+        addr = extract_address(user_text or "")
         if addr:
             mem["address"] = addr
 
-        vdate = extract_visit_date(user_text)
+        vdate = extract_visit_date(user_text or "")
         if vdate:
             mem["visit_date"] = vdate
 
-        vt = extract_visit_time(user_text)
+        vt = extract_visit_time(user_text or "")
         if vt:
             mem["visit_time"] = vt
 
-        # --- замер ---
-        if detect_measurement_interest(user_text):
+        # --- СКИДКИ/АКЦИИ: текст + (в TG) картинка ---
+        if detect_discount_mention(user_text or ""):
+            mem["measure_offer_pending"] = True
+            self.mem_store.save(k, mem)
+
+            msg = build_discounts_message(first, mem.get("city"))
+            self.first_message[k] = False
+
+            # Для Telegram: вернём маркер, адаптер отправит data/tg.png
+            if platform == "tg":
+                return "__PROMO_IMAGE__\n" + msg
+
+            return msg
+
+        # --- намерения ---
+        price_q = detect_price_question(user_text or "")
+        book_measure = detect_measurement_booking_intent(user_text or "")
+        info_measure = detect_measurement_info_question(user_text or "") or detect_measurement_cost_question(user_text or "")
+
+        # отказ от замера / только расчёт
+        if detect_measurement_decline(user_text or "") or detect_calc_only(user_text or ""):
+            mem["calc_only"] = True
+            mem["hot_refusal_lead"] = True
+            mem.pop("agreed_measurement", None)
+
+        # если ранее предложили замер и клиент прислал "да/дата/время/адрес"
+        if mem.get("measure_offer_pending") and not mem.get("agreed_measurement"):
+            if detect_affirm(user_text or "") or book_measure or addr or vdate or vt:
+                mem["agreed_measurement"] = True
+                mem.pop("measure_offer_pending", None)
+                mem.pop("calc_only", None)
+
+        # явное желание записаться на замер
+        if book_measure and not mem.get("calc_only"):
             mem["agreed_measurement"] = True
 
-        if detect_measurement_cost_question(user_text):
-            mem.setdefault("agreed_measurement", True)
+        # авто-согласие, если клиент сам присылает поля заявки (кроме режима "только расчёт")
+        details_count = sum([
+            1 if mem.get("address") else 0,
+            1 if mem.get("visit_date") else 0,
+            1 if mem.get("visit_time") else 0,
+            1 if mem.get("phone") else 0,
+        ])
+        if details_count >= 2 and not mem.get("calc_only"):
+            mem["agreed_measurement"] = True
 
-        # --- цена: 1-й раз не считаем, 2-й раз можно ---
-        if detect_price_question(user_text):
-            if not mem.get("price_requested_once"):
-                mem["price_requested_once"] = True
-                self.mem_store.save(k, mem)
-                return (
-                    build_measurement_pitch()
-                    + "\n\nЕсли всё же нужен предварительный расчёт — напишите город и площадь (м²)."
-                )
-
-        self.mem_store.save(k, mem)
-
-        # если нужен город, но его нет — спросим
-        if needs_city_now(user_text) and not mem.get("city"):
-            if not mem.get("asked_city"):
+        # ------------------- 1) расчёт (без телефона) -------------------
+        if price_q or mem.get("calc_only"):
+            if not mem.get("city"):
                 mem["asked_city"] = True
                 self.mem_store.save(k, mem)
-                return "Подскажите, пожалуйста, в каком вы городе?"
-            return "Уточните город, пожалуйста (например: Ижевск, Верхняя Пышма, Екатеринбург)."
+                self.first_message[k] = False
+                return sanitize_answer(build_need_city(first), allow_greet=first)
 
-        # оформление лида
-        lead_flow = self._maybe_create_lead_if_ready(platform, user_id, mem, meta)
+            if not mem.get("area_m2"):
+                mem["asked_area"] = True
+                self.mem_store.save(k, mem)
+                self.first_message[k] = False
+                return sanitize_answer(build_need_area(first, mem["city"]), allow_greet=first)
+
+            estimate = self.pricing.calculate(
+                city=mem.get("city"),
+                area_m2=mem.get("area_m2"),
+                extras=mem.get("extras") or []
+            )
+            self.mem_store.save(k, mem)
+
+            if getattr(estimate, "min_price", None) is not None:
+                # после расчёта — ВСЕГДА предлагаем замер
+                mem["measure_offer_pending"] = True
+                self.mem_store.save(k, mem)
+
+                # если он "без замера" — создаём горячий лид
+                if mem.get("calc_only"):
+                    self._maybe_create_hot_refusal_lead(platform, user_id, mem, meta)
+
+                ans = build_estimate(int(estimate.min_price))
+                self.first_message[k] = False
+                return sanitize_answer(ans, allow_greet=first)
+
+        # ------------------- 2) инфо про замер/выезд (не анкета сразу) -------------------
+        if info_measure and not mem.get("agreed_measurement"):
+            if not mem.get("city"):
+                mem["asked_city"] = True
+                self.mem_store.save(k, mem)
+                self.first_message[k] = False
+                return sanitize_answer(build_need_city(first), allow_greet=first)
+
+            mem["measure_offer_pending"] = True
+            self.mem_store.save(k, mem)
+            self.first_message[k] = False
+            return sanitize_answer(build_measure_info(first, mem["city"]), allow_greet=first)
+
+        # ------------------- 3) оформление лида на замер -------------------
+        lead_flow = self._maybe_create_measure_lead_if_ready(platform, user_id, mem, meta, first=first)
         if lead_flow:
             history.add_user(user_text)
             history.add_assistant(lead_flow)
-            return lead_flow
+            self.first_message[k] = False
+            return sanitize_answer(lead_flow, allow_greet=first, allow_phone_echo=True)
 
-        # обычный режим
+        # ------------------- 4) старт / обычное общение -------------------
+        if first and not mem.get("city") and not price_q and not info_measure and not book_measure:
+            self.mem_store.save(k, mem)
+            self.first_message[k] = False
+            return sanitize_answer(build_welcome(first=True), allow_greet=True)
+
+        # fallback: LLM (с сильной чисткой)
         city = mem.get("city")
-        promo = self.promos.get_promo(city) if (city and self.first_message.get(k, True)) else ""
+        promo = self.promos.get_promo(city) if (city and first) else ""
+        estimate = self.pricing.calculate(city=city, area_m2=mem.get("area_m2"), extras=mem.get("extras") or [])
 
-        area_for_calc = mem.get("area_m2")
-        extras_for_calc = mem.get("extras") or []
-        estimate = self.pricing.calculate(city=city, area_m2=area_for_calc, extras=extras_for_calc)
-
-        context = build_context(
-            user_text=user_text,
-            estimate=estimate,
-            estimate_details=getattr(estimate, "details", ""),
-            promo=promo,
-            mem=mem
-        )
+        context_parts = [f"Город клиента: {mem.get('city')}"]
+        if mem.get("area_m2"):
+            context_parts.append(f"Площадь (из памяти): {mem['area_m2']} м²")
+        if mem.get("extras"):
+            context_parts.append(f"Допы (из памяти): {mem['extras']}")
+        if getattr(estimate, "min_price", None) is not None:
+            context_parts.append(f"Оценка: от {estimate.min_price} ₽ (ориентир, не точная цена)")
+        if promo:
+            context_parts.append(f"Акция: {promo}")
+        context_parts.append(f"Сообщение клиента: {user_text}")
+        context = "\n".join(context_parts)
 
         history.add_user(user_text)
-
         msgs = history.to_ollama_messages()
         msgs.insert(1, {"role": "system", "content": context})
 
         try:
-            answer = self._ollama_chat(msgs)
+            answer = self.ollama.chat(msgs)
         except Exception as e:
             err = str(e)
             if "timed out" in err.lower():
-                answer = (
-                    "Секунду — модель сейчас прогружается/занята 🤖\n"
-                    "Повторите сообщение через 10–20 секунд.\n"
-                )
+                answer = "Похоже, сервис сейчас занят 🤖 Попробуйте повторить сообщение через 10–20 секунд."
             else:
                 answer = f"Ошибка генерации ответа: {e}"
 
-        allow_greet = bool(self.first_message.get(k, True))
-        answer = sanitize_answer(answer, allow_greet=allow_greet)
-
+        answer = sanitize_answer(answer, allow_greet=first)
         history.add_assistant(answer)
         self.first_message[k] = False
+        self.mem_store.save(k, mem)
         return answer
