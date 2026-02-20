@@ -23,9 +23,11 @@ async def main():
         bot_token = os.getenv("BOT_TOKEN")
         if not bot_token:
             raise RuntimeError("BOT_TOKEN is not set in .env")
-        tasks.append(run_telegram(state, bot_token=bot_token, callcenter_chat_id=callcenter_chat_id))
+        tasks.append(
+            run_telegram(state, bot_token=bot_token, callcenter_chat_id=callcenter_chat_id)
+        )
 
-    # Avito polling (без https)
+    # Avito polling
     if os.getenv("ENABLE_AVITO", "0") == "1":
         tasks.append(run_avito_poller(state))
 

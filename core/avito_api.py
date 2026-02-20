@@ -1,253 +1,283 @@
-# adapters/avito_poller.py
-import asyncio
-import os
+# core/avito_api.py
+from __future__ import annotations
+
+import json
 import time
-from typing import Any, Dict, List, Optional
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
-from core.avito_api import AvitoAPI
-from core.app_state import AppState
-
-
-ALLOWED_TITLES_DEFAULT = [
-    "Натяжные потолки. 2-й и 3-й потолок в подарок",
-    "Натяжные потолки. Потолок в подарок",
-]
-
-HUMAN_TRIGGERS = [
-    "оператор", "менеджер", "живой человек", "человек", "ассистент",
-    "позови", "позовите", "соедини", "соедините", "не бот",
-    "хочу человека", "переключи на человека",
-]
-
-CEILING_KEYWORDS = [
-    "потол", "натяж", "светиль", "люстр", "профил", "тенев",
-    "карниз", "замер", "м2", "м²", "кв",
-]
+import httpx
 
 
-def _norm(s: str) -> str:
-    return (s or "").strip().lower()
+class AvitoAPIError(RuntimeError):
+    def __init__(
+        self,
+        message: str,
+        status_code: Optional[int] = None,
+        details: str = "",
+        request_id: str = "",
+    ):
+        super().__init__(message)
+        self.status_code = status_code
+        self.details = details
+        self.request_id = request_id
 
 
-def _contains_any(text: str, needles: List[str]) -> bool:
-    t = _norm(text)
-    return any(_norm(n) in t for n in needles if n)
+@dataclass
+class AvitoToken:
+    access_token: str
+    token_type: str = "Bearer"
+    expires_at: float = 0.0  # unix ts
+
+    def is_valid(self, skew_sec: int = 30) -> bool:
+        return bool(self.access_token) and (time.time() + skew_sec) < float(self.expires_at or 0.0)
 
 
-def _pick_chat_id(chat: Dict[str, Any]) -> Optional[str]:
-    cid = chat.get("id") or chat.get("chat_id") or chat.get("chatId")
-    return str(cid) if cid is not None else None
+class AvitoAPI:
+    """
+    Client credentials + Messenger API helper.
 
+    ВАЖНО:
+    - У многих аккаунтов GET /messages возвращает 405/404 (как у тебя).
+      Поэтому чтение переписки через API часто недоступно.
+    - Но list_chats обычно отдаёт last_message — этого хватает, чтобы реагировать.
+    """
 
-def _extract_meta(chat_obj: Dict[str, Any]) -> Dict[str, str]:
-    chat_url = str(chat_obj.get("url") or chat_obj.get("web_url") or chat_obj.get("webUrl") or "")
-    ctx = chat_obj.get("context") or {}
-    val = ctx.get("value") if isinstance(ctx.get("value"), dict) else {}
+    def __init__(
+        self,
+        client_id: str,
+        client_secret: str,
+        user_id: int,
+        token_path: str = "data/avito_tokens.json",
+        base_url: str = "https://api.avito.ru",
+        timeout: float = 30.0,
+    ) -> None:
+        self.client_id = (client_id or "").strip()
+        self.client_secret = (client_secret or "").strip()
+        self.user_id = int(user_id)
 
-    title = str(val.get("title") or "")
-    item_url = str(val.get("url") or "")
-    price_string = str(val.get("price_string") or val.get("priceString") or "")
+        self.base_url = base_url.rstrip("/")
+        self.timeout = float(timeout)
 
-    loc = val.get("location") if isinstance(val.get("location"), dict) else {}
-    location_title = str((loc or {}).get("title") or "")
+        self.token_path = Path(token_path)
+        self.token_path.parent.mkdir(parents=True, exist_ok=True)
 
-    return {
-        "title": title,
-        "item_url": item_url,
-        "chat_url": chat_url,
-        "city": location_title,
-        "price_string": price_string,
-    }
+        self._http = httpx.Client(base_url=self.base_url, timeout=self.timeout)
+        self._token: Optional[AvitoToken] = self._load_token()
 
-
-def _get_last_message(chat_obj: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    lm = chat_obj.get("last_message") or chat_obj.get("lastMessage") or chat_obj.get("last_message_info")
-    return lm if isinstance(lm, dict) else None
-
-
-def _msg_id(m: Dict[str, Any]) -> str:
-    mid = m.get("id") or m.get("message_id") or m.get("messageId")
-    return str(mid) if mid is not None else ""
-
-
-def _msg_text(m: Dict[str, Any]) -> str:
-    content = m.get("content") or {}
-    if isinstance(content, dict) and isinstance(content.get("text"), str):
-        return content["text"].strip()
-
-    msg = m.get("message") or {}
-    if isinstance(msg, dict) and isinstance(msg.get("text"), str):
-        return msg["text"].strip()
-
-    if isinstance(m.get("text"), str):
-        return m["text"].strip()
-
-    return ""
-
-
-def _is_incoming(m: Dict[str, Any], my_user_id: int) -> bool:
-    direction = (m.get("direction") or "").lower().strip()
-    if direction in ("in", "incoming"):
-        return True
-    if direction in ("out", "outgoing"):
-        return False
-
-    author = m.get("author_id") or m.get("authorId")
-    try:
-        if author is not None and int(author) == int(my_user_id):
-            return False
-    except Exception:
-        pass
-    return True
-
-
-async def run_avito_poller(state: AppState) -> None:
-    client_id = os.getenv("AVITO_CLIENT_ID", "").strip()
-    client_secret = os.getenv("AVITO_CLIENT_SECRET", "").strip()
-    token_path = os.getenv("AVITO_TOKEN_PATH", "data/avito_tokens.json").strip()
-    user_id = int(os.getenv("AVITO_USER_ID", "0") or "0")
-
-    poll_interval = float(os.getenv("AVITO_POLL_INTERVAL", "3"))
-    manual_hours = float(os.getenv("AVITO_MANUAL_HOURS", "6"))
-
-    debug = os.getenv("AVITO_DEBUG", "0") == "1"
-    trace_chat_id = os.getenv("AVITO_TRACE_CHAT_ID", "").strip()
-
-    allowed_titles_raw = os.getenv("AVITO_ALLOWED_TITLES", "").strip()
-    allowed_titles = [x.strip() for x in allowed_titles_raw.split("|") if x.strip()] if allowed_titles_raw else ALLOWED_TITLES_DEFAULT
-
-    if not client_id or not client_secret or not user_id:
-        raise RuntimeError("Нужно заполнить AVITO_CLIENT_ID, AVITO_CLIENT_SECRET, AVITO_USER_ID")
-
-    api = AvitoAPI(
-        client_id=client_id,
-        client_secret=client_secret,
-        user_id=user_id,
-        token_path=token_path,
-    )
-
-    async def token_refresher():
-        while True:
-            await asyncio.sleep(23 * 3600)
-            try:
-                await asyncio.to_thread(api.refresh_token)
-            except Exception:
-                pass
-
-    asyncio.create_task(token_refresher())
-
-    print("[avito_poller] mode: LAST_MESSAGE (GET messages is not available: 405/404)")
-
-    while True:
+    # ---------------- token ----------------
+    def _load_token(self) -> Optional[AvitoToken]:
+        if not self.token_path.exists():
+            return None
         try:
-            await asyncio.to_thread(api.ensure_token)
-            chats = await asyncio.to_thread(api.list_chats, 100, 0)
+            d = json.loads(self.token_path.read_text(encoding="utf-8"))
+            if not isinstance(d, dict) or not d.get("access_token"):
+                return None
+            return AvitoToken(
+                access_token=str(d.get("access_token", "")),
+                token_type=str(d.get("token_type", "Bearer")),
+                expires_at=float(d.get("expires_at", 0.0)),
+            )
+        except Exception:
+            return None
 
-            if debug:
-                print(f"[avito_poller] tick: chats={len(chats)}")
+    def _save_token(self, t: AvitoToken) -> None:
+        self._token = t
+        self.token_path.write_text(
+            json.dumps(
+                {"access_token": t.access_token, "token_type": t.token_type, "expires_at": t.expires_at},
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
 
-            for ch in chats:
-                chat_id = _pick_chat_id(ch)
-                if not chat_id:
-                    continue
-                if trace_chat_id and chat_id != trace_chat_id:
-                    continue
+    def refresh_token(self) -> AvitoToken:
+        r = self._http.post(
+            "/token/",
+            headers={"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"},
+            data={
+                "grant_type": "client_credentials",
+                "client_id": self.client_id,
+                "client_secret": self.client_secret,
+            },
+        )
+        if r.status_code >= 400:
+            raise AvitoAPIError(
+                "Token error",
+                status_code=r.status_code,
+                details=r.text[:2000],
+                request_id=r.headers.get("x-request-id", ""),
+            )
 
-                last = _get_last_message(ch)
-                if not last:
-                    continue
+        j = r.json()
+        expires_in = int(j.get("expires_in", 86400))
 
-                mid = _msg_id(last)
-                text = _msg_text(last)
-                incoming = _is_incoming(last, user_id)
+        t = AvitoToken(
+            access_token=j["access_token"],
+            token_type=j.get("token_type", "Bearer"),
+            expires_at=time.time() + expires_in,
+        )
+        self._save_token(t)
+        return t
 
-                if not text or not mid or not incoming:
-                    continue
+    def ensure_token(self, refresh_if_less_than_sec: int = 3600) -> None:
+        if self._token and self._token.is_valid(skew_sec=30):
+            if (self._token.expires_at - time.time()) > int(refresh_if_less_than_sec):
+                return
+        self.refresh_token()
 
-                k = f"avito:{chat_id}"
+    def _auth_headers(self) -> Dict[str, str]:
+        self.ensure_token()
+        assert self._token
+        return {
+            "Authorization": f"{self._token.token_type} {self._token.access_token}",
+            "Accept": "application/json",
+        }
 
-                # ✅ ВАЖНО: читаем mem только чтобы проверить дубль
-                mem_before: Dict[str, Any] = state.mem_store.load(k)
-                if str(mem_before.get("avito_last_in_mid") or "") == mid:
-                    continue
+    # ---------------- request helpers ----------------
+    def _request_json(
+        self,
+        method: str,
+        path: str,
+        params: Optional[Dict[str, Any]] = None,
+        json_body: Optional[Dict[str, Any]] = None,
+        allow_statuses: Tuple[int, ...] = (),
+    ) -> Tuple[int, Any, httpx.Response]:
+        r = self._http.request(method, path, headers=self._auth_headers(), params=params, json=json_body)
 
-                meta = _extract_meta(ch)
-                title = meta.get("title", "")
+        # если токен протух — обновим и повторим 1 раз
+        if r.status_code in (401, 403):
+            self._token = None
+            self.ensure_token()
+            r = self._http.request(method, path, headers=self._auth_headers(), params=params, json=json_body)
 
-                if debug:
-                    print(f"[TRACE] chat={chat_id} title='{title}' last_id={mid} in={incoming} text={text!r}")
+        if allow_statuses and r.status_code in allow_statuses:
+            try:
+                return r.status_code, r.json(), r
+            except Exception:
+                return r.status_code, r.text, r
 
-                # фильтр по объявлениям
-                if title and allowed_titles and not any(title.strip() == t.strip() for t in allowed_titles):
-                    mem_before["avito_last_in_mid"] = mid
-                    state.mem_store.save(k, mem_before)
-                    if debug:
-                        print("[TRACE] skip: title not allowed")
-                    continue
+        if r.status_code >= 400:
+            raise AvitoAPIError(
+                f"{method} {path} -> {r.status_code}",
+                status_code=r.status_code,
+                details=(r.text or "")[:2000],
+                request_id=r.headers.get("x-request-id", ""),
+            )
 
-                # защита по тематике (если title пустой)
-                if not title and not _contains_any(text, CEILING_KEYWORDS):
-                    mem_before["avito_last_in_mid"] = mid
-                    state.mem_store.save(k, mem_before)
-                    if debug:
-                        print("[TRACE] skip: not ceiling topic")
-                    continue
+        try:
+            return r.status_code, r.json(), r
+        except Exception:
+            return r.status_code, r.text, r
 
-                now = time.time()
-                manual_until = float(mem_before.get("manual_until") or 0)
+    @staticmethod
+    def _pick_list(payload: Any) -> List[Dict[str, Any]]:
+        if isinstance(payload, list):
+            return [x for x in payload if isinstance(x, dict)]
+        if isinstance(payload, dict):
+            for k in ("chats", "items", "data", "result", "messages"):
+                v = payload.get(k)
+                if isinstance(v, list):
+                    return [x for x in v if isinstance(x, dict)]
+        return []
 
-                if manual_until > now:
-                    mem_before["avito_last_in_mid"] = mid
-                    state.mem_store.save(k, mem_before)
-                    continue
+    # ---------------- messenger ----------------
+    def get_chat(self, chat_id: str) -> Dict[str, Any]:
+        # иногда работает, иногда 404 (как у тебя) — поэтому poller на это не опирается
+        _, data, _ = self._request_json("GET", f"/messenger/v1/accounts/{self.user_id}/chats/{chat_id}", allow_statuses=(404,))
+        return data if isinstance(data, dict) else {}
 
-                if _contains_any(text, HUMAN_TRIGGERS):
-                    mem_before["manual_until"] = now + manual_hours * 3600
-                    mem_before["manual_started_at"] = now
-                    mem_before["manual_reason"] = "client_requested_human"
-                    mem_before["avito_last_in_mid"] = mid
-                    state.mem_store.save(k, mem_before)
+    def list_chats(self, limit: int = 100, offset: int = 0) -> List[Dict[str, Any]]:
+        """
+        У Авито бывает:
+        - v2 /chats без limit/offset (иначе 400)
+        - v1 /chats с limit/offset
+        """
+        # v2 без params
+        for p in (f"/messenger/v2/accounts/{self.user_id}/chats", f"/messenger/v2/accounts/{self.user_id}/chats/"):
+            code, data, _ = self._request_json("GET", p, allow_statuses=(400, 403, 404))
+            if code < 400:
+                return self._pick_list(data)
 
-                    link = meta.get("chat_url") or meta.get("item_url") or "https://www.avito.ru/profile/messenger"
-                    state.notify_now(
-                        "🆘 Клиент просит менеджера (Авито)\n"
-                        f"Chat ID: {chat_id}\n"
-                        f"Объявление: {title or '-'}\n"
-                        f"Ссылка: {link}\n"
-                        f"Сообщение:\n{text}"
-                    )
-                    try:
-                        await asyncio.to_thread(api.send_text, chat_id, "Понял(а) ✅ Передал(а) менеджеру — он ответит вам в этом чате.")
-                    except Exception:
-                        pass
-                    continue
+        # v1 с пагинацией
+        for p in (f"/messenger/v1/accounts/{self.user_id}/chats", f"/messenger/v1/accounts/{self.user_id}/chats/"):
+            code, data, _ = self._request_json(
+                "GET",
+                p,
+                params={"limit": int(limit), "offset": int(offset)},
+                allow_statuses=(400, 403, 404),
+            )
+            if code < 400:
+                return self._pick_list(data)
 
-                # ✅ Генерация ответа (AppState сам сохраняет память/диалог)
-                reply = await asyncio.to_thread(
-                    state.generate_reply,
-                    "avito",
-                    chat_id,
-                    text,
-                    meta,
-                )
+        # v2 с params (на всякий)
+        for p in (f"/messenger/v2/accounts/{self.user_id}/chats", f"/messenger/v2/accounts/{self.user_id}/chats/"):
+            code, data, _ = self._request_json(
+                "GET",
+                p,
+                params={"limit": int(limit), "offset": int(offset)},
+                allow_statuses=(400, 403, 404),
+            )
+            if code < 400:
+                return self._pick_list(data)
 
-                if reply and reply.strip():
-                    try:
-                        await asyncio.to_thread(api.send_text, chat_id, reply)
-                    except Exception as e:
-                        print(f"[avito_poller] send error: {e}")
+        return []
 
-                try:
-                    await asyncio.to_thread(api.mark_read, chat_id)
-                except Exception:
-                    pass
+    def list_messages(self, chat_id: str, limit: int = 30, offset: int = 0) -> List[Dict[str, Any]]:
+        """
+        У тебя это возвращает 405/404 — оставляю метод, но он мягко деградирует.
+        """
+        paths = [
+            f"/messenger/v2/accounts/{self.user_id}/chats/{chat_id}/messages/",
+            f"/messenger/v2/accounts/{self.user_id}/chats/{chat_id}/messages",
+            f"/messenger/v1/accounts/{self.user_id}/chats/{chat_id}/messages/",
+            f"/messenger/v1/accounts/{self.user_id}/chats/{chat_id}/messages",
+        ]
+        for p in paths:
+            code, data, _ = self._request_json(
+                "GET",
+                p,
+                params={"limit": int(limit), "offset": int(offset)},
+                allow_statuses=(400, 403, 404, 405),
+            )
+            if code == 405:
+                return []
+            if code < 400:
+                return self._pick_list(data)
+        return []
 
-                # ✅ КЛЮЧЕВО: НЕ сохраняем старый mem_before, а подгружаем актуальный mem после generate_reply
-                mem_after: Dict[str, Any] = state.mem_store.load(k)
-                mem_after["avito_last_in_mid"] = mid
-                state.mem_store.save(k, mem_after)
+    def mark_read(self, chat_id: str) -> None:
+        for p in (
+            f"/messenger/v1/accounts/{self.user_id}/chats/{chat_id}/read",
+            f"/messenger/v1/accounts/{self.user_id}/chats/{chat_id}/read/",
+        ):
+            code, _, _ = self._request_json("POST", p, allow_statuses=(400, 403, 404))
+            if code < 400:
+                return
 
-        except Exception as e:
-            print(f"[avito_poller] LOOP ERROR: {e}")
+    def send_text(self, chat_id: str, text: str) -> None:
+        path = f"/messenger/v1/accounts/{self.user_id}/chats/{chat_id}/messages"
 
-        await asyncio.sleep(float(poll_interval))
+        variants = [
+            {"type": "text", "message": {"text": text}},
+            {"type": "text", "content": {"text": text}},
+            {"text": text},
+        ]
+
+        last_err: Optional[Tuple[int, str]] = None
+        for payload in variants:
+            r = self._http.post(path, headers=self._auth_headers(), json=payload)
+            if r.status_code < 400:
+                return
+            last_err = (r.status_code, r.text or "")
+
+        code, body = last_err or (400, "unknown")
+        raise AvitoAPIError("send_text failed", status_code=code, details=body[:2000])
+
+    def close(self) -> None:
+        try:
+            self._http.close()
+        except Exception:
+            pass

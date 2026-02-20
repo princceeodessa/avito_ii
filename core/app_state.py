@@ -483,7 +483,6 @@ class AppState:
     def _append_dialog_log(self, platform: str, user_id: str, role: str, text: str) -> None:
         try:
             safe_user = "".join(ch for ch in str(user_id) if ch.isalnum() or ch in ("-", "_"))[:80]
-            self._append_dialog_log(platform, user_id, role, text)
             path = os.path.join(self.dialog_log_dir, f"{platform}_{safe_user}.txt")
             ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
             line = f"[{ts}] {role}: {text.strip()}\n"
