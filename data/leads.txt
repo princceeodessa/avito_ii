@@ -13,3 +13,4 @@
 [2026-02-18 15:57:04] platform=tg user_id=6887355743 username=blagodarmarket name=БлагоДар Маркетинг city=Ижевск area_m2=45.0 extras=None visit_time=19:02 address=союзная 27а phone=+79821210736
 [2026-02-18 16:11:07] platform=tg user_id=6887355743 username=blagodarmarket name=БлагоДар Маркетинг city=Сарапул area_m2=45.0 extras=None visit_time=19:02 address=союзная 27а phone=+79821210736
 [2026-02-18 17:30:30] platform=tg user_id=6887355743 username=blagodarmarket name=БлагоДар Маркетинг city=Ижевск area_m2=None extras=None visit_time=19:02 address=союзная 27а phone=+79821210736
+[2026-02-20 12:57:41] platform=tg user_id=6887355743 username=blagodarmarket name=БлагоДар Маркетинг lead_kind=measure city=Ижевск area_m2=31.0 extras=None visit_date=23 февраля visit_time=18:00 address=союзная 27а phone=+79821210736

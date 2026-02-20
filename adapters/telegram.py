@@ -1,7 +1,7 @@
 # adapters/telegram.py
 import asyncio
 from collections import defaultdict
-from typing import Dict, List, Optional, Any
+from typing import Any, Dict, List
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command
@@ -11,14 +11,12 @@ from core.app_state import AppState
 
 
 class DebouncedReply:
-    """
-    Склеивает сообщения от одного пользователя, пришедшие подряд за короткое время,
-    и отвечает одним сообщением.
-    """
+    """Склеивает сообщения от одного пользователя, пришедшие подряд за короткое время, и отвечает одним сообщением."""
+
     def __init__(self, bot: Bot, state: AppState, delay: float = 5, platform: str = "tg"):
         self.bot = bot
         self.state = state
-        self.delay = delay
+        self.delay = float(delay)
         self.platform = platform
 
         self._buffers: Dict[int, List[str]] = defaultdict(list)
@@ -49,20 +47,24 @@ class DebouncedReply:
             return
 
         user_text = "\n".join(parts).strip()
-
         meta = {
             "username": (message.from_user.username or ""),
             "name": (message.from_user.full_name or ""),
         }
 
-        reply = self.state.generate_reply(
+        # Важно: generate_reply может блокировать (LLM/requests),
+        # поэтому уводим в отдельный поток.
+        reply = await asyncio.to_thread(
+            self.state.generate_reply,
             platform=self.platform,
             user_id=str(uid),
             user_text=user_text,
-            meta=meta
+            meta=meta,
         )
 
         if reply:
+            # если ядро вернуло маркер промо-картинки — не шлём его как текст
+            reply = reply.replace("__PROMO_IMAGE__\n", "")
             await self.bot.send_message(chat_id=message.chat.id, text=reply)
 
 
@@ -93,14 +95,12 @@ async def run_telegram(
     debouncer = DebouncedReply(bot=bot, state=state, delay=debounce_delay, platform="tg")
 
     # --- commands (без дебаунса) ---
-
     @router.message(Command("start"))
     async def cmd_start(message: Message):
         await message.answer(
-            "Здравствуйте! Я менеджер по натяжным потолкам 😊\n"
+            "Здравствуйте! Я Ульяна помощник по натяжным потолкам 🙂\n"
             "Напишите, пожалуйста, город и примерную площадь (м²).\n"
             "Замер бесплатный — мастер приезжает с каталогами и образцами.\n"
-            "/reset — сбросить диалог."
         )
 
     @router.message(Command("reset"))
@@ -108,17 +108,16 @@ async def run_telegram(
         if not message.from_user:
             return
         state.reset_all(platform="tg", user_id=str(message.from_user.id))
-        await message.answer("Ок, историю и данные сбросил. Напишите новый запрос.")
+        await message.answer("Ок, историю и данные сбросил. Напишите новый запрос 🙂")
 
     # --- обычные сообщения (с дебаунсом) ---
-
     @router.message(F.text)
     async def on_text(message: Message):
         text = (message.text or "").strip()
         if not text:
             return
 
-        # любые команды пусть обрабатываются только Command-хендлерами
+        # команды пусть обрабатываются только Command-хендлерами
         if text.startswith("/"):
             return
 
