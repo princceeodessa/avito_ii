@@ -16,7 +16,7 @@ from core.pricing import PricingEngine
 from core.promotions import PromotionManager
 from core.response import OllamaClient
 
-SYSTEM_PROMPT = """Ты — менеджер по натяжным потолкам.
+SYSTEM_PROMPT = """Ты — Ульяна, менеджер по натяжным потолкам.
 Общайся по-русски.
 
 ЖЁСТКИЕ ПРАВИЛА:
@@ -125,18 +125,74 @@ def extract_city_candidate(text: str) -> Optional[str]:
     t = (text or "").strip()
     if not t:
         return None
+
+    # Нормализуем для проверок
+    low = t.lower().replace("ё", "е").strip()
+    low = re.sub(r"[^\w\s\-]+", "", low, flags=re.IGNORECASE)
+    low = re.sub(r"\s+", " ", low).strip()
+
+    # 1) Отсекаем приветствия/мусор (включая частые опечатки)
+    if re.fullmatch(
+        r"(привет|приветствую|здравствуйте|здравствуй|здраствуйте|здравсвуйте|здрастуйте|здрасьте|"
+        r"добрый день|добрый вечер|доброе утро|спасибо|ок|окей|ага)",
+        low,
+    ):
+        return None
+
+    # если одно слово и явно похоже на приветствие (даже с опечаткой)
+    if re.fullmatch(r"[a-zа-я\-]{3,30}", low) and re.match(r"^(здрав|здра|прив|доб|спас)", low):
+        return None
+
+    # 2) Явная форма: "город X" / "г. X"
     m = CITY_CANDIDATE_RE.search(t)
     if m:
         cand = m.group(1).strip(" ,.!?:;()[]{}\"'").strip()
         cand = re.sub(r"\s+", " ", cand)
         if 2 <= len(cand) <= 40:
             return cand
-    # если сообщение — это просто одно слово (часто так пишут город)
+
+    # 3) Если сообщение — просто одно слово (часто так пишут город)
     if re.fullmatch(r"[A-Za-zА-Яа-яЁё\-]{3,30}", t):
         return t
+
     return None
 
+# --- anti-duplicate helpers ---
+QUESTION_MATERIALS_RE = re.compile(
+    r"\b(материал(ы|ов)?|полотно|работа\s+под\s+ключ|под\s+ключ|с\s+работой|монтаж|установка|включает)\b",
+    re.IGNORECASE,
+)
 
+THANKS_CHEAP_RE = re.compile(r"\b(спасибо|понял(а)?|ок)\b", re.IGNORECASE)
+
+def detect_materials_question(text: str) -> bool:
+    return bool(QUESTION_MATERIALS_RE.search(text or ""))
+
+def _estimate_signature(mem: Dict[str, Any], min_price: Optional[int]) -> str:
+    city = str(mem.get("city") or "")
+    area = str(mem.get("area_m2") or "")
+    extras = ",".join(mem.get("extras") or []) if isinstance(mem.get("extras"), list) else str(mem.get("extras") or "")
+    mp = str(min_price or "")
+    return f"{city}|{area}|{extras}|{mp}"
+
+def _is_duplicate_estimate(mem: Dict[str, Any], sig: str, ttl_sec: int = 900) -> bool:
+    prev = mem.get("_last_estimate_sig")
+    prev_ts = float(mem.get("_last_estimate_ts") or 0)
+    if prev and prev == sig and (time.time() - prev_ts) < ttl_sec:
+        return True
+    return False
+
+def _remember_estimate(mem: Dict[str, Any], sig: str) -> None:
+    mem["_last_estimate_sig"] = sig
+    mem["_last_estimate_ts"] = time.time()
+
+def build_materials_vs_turnkey(first: bool) -> str:
+    return (
+        f"{t_hello(first)}Это ориентир *под ключ* ✅\n"
+        "Обычно включает: полотно, профиль/крепёж и монтаж.\n"
+        "Не входит (если нужно): сложные ниши/карнизы, доп.работы по электрике, большое количество светильников.\n"
+        "Если скажете, сколько точек света и есть ли карниз/трубы — уточню ориентир."
+    )
 # ------------------- discounts/intent helpers -------------------
 DISCOUNT_RE = re.compile(r"\b(скидк\w*|акци\w*|подар\w*|промокод\w*|купон\w*|бонус\w*)\b", re.IGNORECASE)
 def detect_discount_mention(text: str) -> bool:
@@ -317,14 +373,14 @@ def build_need_city(first: bool) -> str:
 
 def build_city_not_supported(first: bool, city_candidate: str) -> str:
     return (
-        f"{t_hello(first)}Понял(а) вас. Пока, к сожалению, не работаем в городе «{city_candidate}».\n"
+        f"{t_hello(first)}Поняла вас. Пока, к сожалению, не работаем в городе «{city_candidate}».\n"
         "Сейчас выезжаем по Ижевску и Екатеринбургу (и ближайшим районам).\n"
         "Если объект в этих городах — напишите город и площадь (м²), сориентирую по стоимости."
     )
 
 def build_need_area(first: bool, city: str) -> str:
     return (
-        f"{t_hello(first)}{city} — понял(а).\n"
+        f"{t_hello(first)}{city} — поняла.\n"
         "Чтобы назвать ориентир по стоимости, подскажите площадь (м²). Можно примерно."
     )
 
@@ -372,7 +428,7 @@ def build_lead_confirmation(mem: Dict[str, Any]) -> str:
         f"Адрес: {mem.get('address')}\n"
         f"Телефон: {mem.get('phone')}\n"
         f"Дата и время: {vdate} в {vtime}\n\n"
-        "Мастер/диспетчер подтвердит детали. Если нужно поменять время — просто напишите."
+        "Менеджер с вами свяжется подтвердит детали. Если нужно поменять время — просто напишите."
     )
 
 
@@ -776,7 +832,45 @@ class AppState:
             self._push_dialog(mem, "assistant", ans)
             mem["_started"] = True
             self.mem_store.save(k, mem)
+            minp = int(estimate.min_price)
+            sig = _estimate_signature(mem, minp)
+
+            # если уже недавно давали такой же прайс — не повторяем
+            if _is_duplicate_estimate(mem, sig):
+                # 1) если вопрос "это материалы или под ключ?"
+                if detect_materials_question(user_text):
+                    ans = sanitize_answer(build_materials_vs_turnkey(first), allow_greet=first)
+
+                # 2) если "дорого" — отдельный ответ (если у тебя уже есть build_price_objection — используй его)
+                elif "дорог" in (user_text or "").lower():
+                    ans = sanitize_answer(
+                        "Понимаю 😊\n"
+                        "Можем сделать дешевле: матовый/сатин, простой профиль и без сложных ниш.\n"
+                        "Хотите — подберу минимальный вариант под ваш бюджет. Сколько светильников планируете?",
+                        allow_greet=first,
+                    )
+
+                # 3) если спрашивает про замер/выезд
+                elif detect_measurement_booking_intent(user_text):
+                    mem["agreed_measurement"] = True
+                    ans = sanitize_answer(build_measure_intro(first), allow_greet=first)
+
+                # 4) иначе просто не повторяем прайс, а задаём один уточняющий вопрос
+                else:
+                    ans = sanitize_answer(
+                        f"{t_hello(first)}Поняла 😊\n"
+                        "Если нужно — уточните допы (светильники/карниз/трубы), и я скорректирую ориентир.\n"
+                        "Либо могу записать на бесплатный замер.",
+                        allow_greet=first,
+                    )
+
+            else:
+                _remember_estimate(mem, sig)
+                ans = build_estimate(minp, city=str(mem["city"]), area_m2=float(mem["area_m2"]),
+                                     ask_measure=not bool(mem.get("calc_only")))
+                ans = sanitize_answer(ans, allow_greet=first)
             return ans
+
 
         # ------------------- 2) инфо про замер -------------------
         if info_measure and not mem.get("agreed_measurement"):

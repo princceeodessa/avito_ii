@@ -1,40 +1,70 @@
-import asyncio
 import os
+import sys
+import asyncio
 from dotenv import load_dotenv
+
+if sys.platform.startswith("win"):
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 from core.app_state import AppState
 from adapters.telegram import run_telegram
 from adapters.avito_poller import run_avito_poller
+from adapters.vk import run_vk
+
+
+def log_task_result(t: asyncio.Task) -> None:
+    try:
+        exc = t.exception()
+        if exc:
+            print(f"[task error] {t.get_name()}: {exc}")
+    except asyncio.CancelledError:
+        pass
 
 
 async def main():
     load_dotenv()
 
-    model = os.getenv("OLLAMA_MODEL", "qwen2.5:3b")
-    ollama_timeout = int(os.getenv("OLLAMA_TIMEOUT", "240"))
-    callcenter_chat_id = os.getenv("CALLCENTER_CHAT_ID", "")
-
+    model = os.getenv("OLLAMA_MODEL", "llama3")
+    ollama_timeout = int(os.getenv("OLLAMA_TIMEOUT", "240") or "240")
     state = AppState(model=model, ollama_timeout=ollama_timeout)
 
     tasks = []
 
-    # Telegram
-    if os.getenv("ENABLE_TELEGRAM", "1") == "1":
-        bot_token = os.getenv("BOT_TOKEN")
-        if not bot_token:
-            raise RuntimeError("BOT_TOKEN is not set in .env")
-        tasks.append(
-            run_telegram(state, bot_token=bot_token, callcenter_chat_id=callcenter_chat_id)
+    if os.getenv("ENABLE_TG", "0") == "1":
+        tg_token = (os.getenv("TELEGRAM_TOKEN", "") or "").strip()
+        print("[main] ENABLE_TG=1, token_len=", len(tg_token))
+        t = asyncio.create_task(
+            run_telegram(
+                state=state,
+                bot_token=tg_token,
+                callcenter_chat_id=os.getenv("CALLCENTER_CHAT_ID", ""),
+                debounce_delay=float(os.getenv("TG_DEBOUNCE_DELAY", "1.2") or "1.2"),
+            ),
+            name="telegram",
         )
+        t.add_done_callback(log_task_result)
+        tasks.append(t)
 
-    # Avito polling
     if os.getenv("ENABLE_AVITO", "0") == "1":
-        tasks.append(run_avito_poller(state))
+        t = asyncio.create_task(run_avito_poller(state), name="avito")
+        t.add_done_callback(log_task_result)
+        tasks.append(t)
+
+    if os.getenv("ENABLE_VK", "0") == "1":
+        t = asyncio.create_task(run_vk(state), name="vk")
+        t.add_done_callback(log_task_result)
+        tasks.append(t)
 
     if not tasks:
-        raise RuntimeError("No adapters enabled")
+        raise RuntimeError("Ни один адаптер не включён. Поставь ENABLE_TG/ENABLE_AVITO/ENABLE_VK=1")
 
-    await asyncio.gather(*tasks)
+    # ✅ важно: return_exceptions=True — чтобы одна упавшая таска не гробила остальные
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    # если что-то вернулось как исключение — напечатаем
+    for r in results:
+        if isinstance(r, Exception):
+            print("[main] task exception:", repr(r))
 
 
 if __name__ == "__main__":

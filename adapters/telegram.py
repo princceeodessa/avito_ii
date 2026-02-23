@@ -1,24 +1,22 @@
 # adapters/telegram.py
 import asyncio
+import os
 from collections import defaultdict
-from typing import Any, Dict, List
+from typing import Dict, List
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command
-from aiogram.types import Message
+from aiogram.types import FSInputFile, Message
 
 from core.app_state import AppState
 
 
 class DebouncedReply:
-    """Склеивает сообщения от одного пользователя, пришедшие подряд за короткое время, и отвечает одним сообщением."""
-
-    def __init__(self, bot: Bot, state: AppState, delay: float = 5, platform: str = "tg"):
+    def __init__(self, bot: Bot, state: AppState, delay: float = 1.2, platform: str = "tg"):
         self.bot = bot
         self.state = state
         self.delay = float(delay)
         self.platform = platform
-
         self._buffers: Dict[int, List[str]] = defaultdict(list)
         self._tasks: Dict[int, asyncio.Task] = {}
 
@@ -29,7 +27,6 @@ class DebouncedReply:
         uid = message.from_user.id
         self._buffers[uid].append(message.text.strip())
 
-        # если юзер докинул сообщение — отменяем предыдущую отправку и ждём заново
         t = self._tasks.get(uid)
         if t and not t.done():
             t.cancel()
@@ -52,20 +49,37 @@ class DebouncedReply:
             "name": (message.from_user.full_name or ""),
         }
 
-        # Важно: generate_reply может блокировать (LLM/requests),
-        # поэтому уводим в отдельный поток.
-        reply = await asyncio.to_thread(
-            self.state.generate_reply,
-            platform=self.platform,
-            user_id=str(uid),
-            user_text=user_text,
-            meta=meta,
-        )
+        try:
+            reply = await asyncio.to_thread(
+                self.state.generate_reply,
+                platform=self.platform,
+                user_id=str(uid),
+                user_text=user_text,
+                meta=meta,
+            )
+        except Exception as e:
+            # чтобы TG не молчал при падении LLM
+            await self.bot.send_message(
+                chat_id=message.chat.id,
+                text="Сервис ответа сейчас занят 😕 Попробуйте ещё раз через 10–20 секунд.",
+            )
+            print(f"[tg] generate_reply error: {e}")
+            return
 
-        if reply:
-            # если ядро вернуло маркер промо-картинки — не шлём его как текст
-            reply = reply.replace("__PROMO_IMAGE__\n", "")
-            await self.bot.send_message(chat_id=message.chat.id, text=reply)
+        if not reply:
+            return
+
+        # промо-маркер
+        if reply.startswith("__PROMO_IMAGE__\n"):
+            text = reply.split("\n", 1)[1].strip()
+            promo_path = os.getenv("TG_PROMO_IMAGE_PATH", "data/promo_tg.png")
+            if os.path.exists(promo_path):
+                await self.bot.send_photo(chat_id=message.chat.id, photo=FSInputFile(promo_path), caption=text)
+            else:
+                await self.bot.send_message(chat_id=message.chat.id, text=text)
+            return
+
+        await self.bot.send_message(chat_id=message.chat.id, text=reply)
 
 
 async def run_telegram(
@@ -78,7 +92,6 @@ async def run_telegram(
     dp = Dispatcher()
     router = Router()
 
-    # --- callcenter notifier ---
     callcenter_chat_id = (callcenter_chat_id or "").strip()
 
     async def notify_coro(text: str) -> None:
@@ -87,20 +100,18 @@ async def run_telegram(
         try:
             await bot.send_message(chat_id=int(callcenter_chat_id), text=text)
         except Exception:
-            # чтобы бот не падал из-за проблем с отправкой в колл-центр
             return
 
     state.set_notifier(asyncio.get_running_loop(), notify_coro)
-
     debouncer = DebouncedReply(bot=bot, state=state, delay=debounce_delay, platform="tg")
 
-    # --- commands (без дебаунса) ---
     @router.message(Command("start"))
     async def cmd_start(message: Message):
         await message.answer(
-            "Здравствуйте! Я Ульяна помощник по натяжным потолкам 🙂\n"
+            "Здравствуйте! Я менеджер по натяжным потолкам 😊\n"
             "Напишите, пожалуйста, город и примерную площадь (м²).\n"
             "Замер бесплатный — мастер приезжает с каталогами и образцами.\n"
+            "/reset — сбросить диалог."
         )
 
     @router.message(Command("reset"))
@@ -110,17 +121,11 @@ async def run_telegram(
         state.reset_all(platform="tg", user_id=str(message.from_user.id))
         await message.answer("Ок, историю и данные сбросил. Напишите новый запрос 🙂")
 
-    # --- обычные сообщения (с дебаунсом) ---
     @router.message(F.text)
     async def on_text(message: Message):
         text = (message.text or "").strip()
-        if not text:
+        if not text or text.startswith("/"):
             return
-
-        # команды пусть обрабатываются только Command-хендлерами
-        if text.startswith("/"):
-            return
-
         await debouncer.push(message)
 
     dp.include_router(router)
