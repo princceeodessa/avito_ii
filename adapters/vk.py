@@ -67,7 +67,7 @@ async def vk_get_longpoll(session: aiohttp.ClientSession, token: str, group_id: 
 
 class DebouncedReply:
     """
-    Как в Telegram: склеиваем несколько сообщений пользователя и отвечаем одним сообщением.
+    Склеиваем несколько сообщений пользователя и отвечаем одним сообщением.
     """
 
     def __init__(self, state: AppState, delay: float = 1.2):
@@ -127,19 +127,22 @@ class DebouncedReply:
 
 
 async def run_vk(state: AppState) -> None:
-
     token = os.getenv("VK_GROUP_TOKEN", "").strip()
     group_id = parse_int_env("VK_GROUP_ID", 0)
+
+    # ✅ Важно: ограничение "только одному юзеру" снято.
+    # Если VK_TEST_USER_ID не задан (или 0) — отвечаем всем.
+    # Если VK_TEST_USER_ID задан — отвечаем только этому user_id (тестовый режим).
     test_user_id = parse_int_env("VK_TEST_USER_ID", 0)
 
     poll_wait = parse_int_env("VK_POLL_WAIT", 25)
     debounce_delay = float((os.getenv("VK_DEBOUNCE_DELAY", "1.2") or "1.2").strip())
     debug = os.getenv("VK_DEBUG", "0") == "1"
 
-    if not token or not group_id or not test_user_id:
-        raise RuntimeError("Нужно задать VK_GROUP_TOKEN, VK_GROUP_ID, VK_TEST_USER_ID")
+    if not token or not group_id:
+        raise RuntimeError("Нужно задать VK_GROUP_TOKEN и VK_GROUP_ID")
 
-    # ✅ Forced IPv4 (полезно на Windows)
+    # ✅ Forced IPv4
     connector = aiohttp.TCPConnector(family=socket.AF_INET, ssl=True)
 
     # ✅ Таймауты
@@ -196,15 +199,14 @@ async def run_vk(state: AppState) -> None:
                     from_id = int(msg.get("from_id") or 0)
                     peer_id = int(msg.get("peer_id") or 0)
 
-                    # тестовый режим: отвечаем только одному юзеру
-                    if from_id != test_user_id:
+                    # ✅ Опциональный тестовый режим
+                    if test_user_id and from_id != test_user_id:
                         if debug:
                             print(f"[vk] ignored user {from_id} (test only {test_user_id})")
                         continue
 
                     conv_id = int(msg.get("conversation_message_id") or 0)
                     if conv_id and seen_conv_ids.get(from_id) == conv_id:
-                        # один и тот же апдейт пришёл повторно
                         continue
                     if conv_id:
                         seen_conv_ids[from_id] = conv_id

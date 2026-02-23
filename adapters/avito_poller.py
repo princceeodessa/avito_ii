@@ -8,17 +8,13 @@ from core.avito_api import AvitoAPI
 from core.app_state import AppState
 
 
-ALLOWED_TITLES_DEFAULT = [
-    "Натяжные потолки. 2-й и 3-й потолок в подарок",
-    "Натяжные потолки. Потолок в подарок",
-]
-
 HUMAN_TRIGGERS = [
     "оператор", "менеджер", "живой человек", "человек", "ассистент",
     "позови", "позовите", "соедини", "соедините", "не бот",
     "хочу человека", "переключи на человека",
 ]
 
+# ✅ Тема "натяжные потолки" — по этим словам считаем, что это наш клиент.
 CEILING_KEYWORDS = [
     "потол", "натяж", "светиль", "люстр", "профил", "тенев",
     "карниз", "замер", "м2", "м²", "кв",
@@ -111,10 +107,10 @@ async def run_avito_poller(state: AppState) -> None:
     manual_hours = float(os.getenv("AVITO_MANUAL_HOURS", "6"))
 
     debug = os.getenv("AVITO_DEBUG", "0") == "1"
-    trace_chat_id = os.getenv("AVITO_TRACE_CHAT_ID", "").strip()
 
-    allowed_titles_raw = os.getenv("AVITO_ALLOWED_TITLES", "").strip()
-    allowed_titles = [x.strip() for x in allowed_titles_raw.split("|") if x.strip()] if allowed_titles_raw else ALLOWED_TITLES_DEFAULT
+    # ⚠️ Если у тебя в .env было AVITO_TRACE_CHAT_ID — оно режет всё до одного чата.
+    # Оставляем как "отладочный" флаг, но если хочешь отвечать всем — просто не задавай его.
+    trace_chat_id = os.getenv("AVITO_TRACE_CHAT_ID", "").strip()
 
     if not client_id or not client_secret or not user_id:
         raise RuntimeError("Нужно заполнить AVITO_CLIENT_ID, AVITO_CLIENT_SECRET, AVITO_USER_ID")
@@ -150,6 +146,8 @@ async def run_avito_poller(state: AppState) -> None:
                 chat_id = _pick_chat_id(ch)
                 if not chat_id:
                     continue
+
+                # ✅ Отладка (по умолчанию пусто). Если заполнено — режет до одного чата.
                 if trace_chat_id and chat_id != trace_chat_id:
                     continue
 
@@ -166,7 +164,7 @@ async def run_avito_poller(state: AppState) -> None:
 
                 k = f"avito:{chat_id}"
 
-                # ✅ ВАЖНО: читаем mem только чтобы проверить дубль
+                # ✅ Проверка дубля
                 mem_before: Dict[str, Any] = state.mem_store.load(k)
                 if str(mem_before.get("avito_last_in_mid") or "") == mid:
                     continue
@@ -177,16 +175,12 @@ async def run_avito_poller(state: AppState) -> None:
                 if debug:
                     print(f"[TRACE] chat={chat_id} title='{title}' last_id={mid} in={incoming} text={text!r}")
 
-                # фильтр по объявлениям
-                if title and allowed_titles and not any(title.strip() == t.strip() for t in allowed_titles):
-                    mem_before["avito_last_in_mid"] = mid
-                    state.mem_store.save(k, mem_before)
-                    if debug:
-                        print("[TRACE] skip: title not allowed")
-                    continue
-
-                # защита по тематике (если title пустой)
-                if not title and not _contains_any(text, CEILING_KEYWORDS):
+                # ✅ Главное изменение:
+                # Раньше был фильтр "только по конкретным заголовкам объявлений".
+                # Теперь отвечаем на любые чаты, если тема похожа на натяжные потолки:
+                # - по тексту сообщения
+                # - или по заголовку объявления (если он есть)
+                if not (_contains_any(text, CEILING_KEYWORDS) or _contains_any(title, CEILING_KEYWORDS)):
                     mem_before["avito_last_in_mid"] = mid
                     state.mem_store.save(k, mem_before)
                     if debug:
@@ -222,7 +216,7 @@ async def run_avito_poller(state: AppState) -> None:
                         pass
                     continue
 
-                # ✅ Генерация ответа (AppState сам сохраняет память/диалог)
+                # ✅ Генерация ответа
                 reply = await asyncio.to_thread(
                     state.generate_reply,
                     "avito",
@@ -242,7 +236,7 @@ async def run_avito_poller(state: AppState) -> None:
                 except Exception:
                     pass
 
-                # ✅ КЛЮЧЕВО: НЕ сохраняем старый mem_before, а подгружаем актуальный mem после generate_reply
+                # ✅ Запоминаем последний входящий mid
                 mem_after: Dict[str, Any] = state.mem_store.load(k)
                 mem_after["avito_last_in_mid"] = mid
                 state.mem_store.save(k, mem_after)
