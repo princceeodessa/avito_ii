@@ -29,9 +29,9 @@ async def main():
     state = AppState(model=model, ollama_timeout=ollama_timeout)
 
     tasks = []
-
-    if os.getenv("ENABLE_TG", "0") == "1":
-        tg_token = (os.getenv("TELEGRAM_TOKEN", "") or "").strip()
+    enable_tg = (os.getenv("ENABLE_TG") or os.getenv("ENABLE_TELEGRAM") or "0").strip()
+    if enable_tg == "1":
+        tg_token = (os.getenv("TELEGRAM_TOKEN") or os.getenv("BOT_TOKEN") or "").strip()
         print("[main] ENABLE_TG=1, token_len=", len(tg_token))
         t = asyncio.create_task(
             run_telegram(

@@ -16,7 +16,7 @@ from core.pricing import PricingEngine
 from core.promotions import PromotionManager
 from core.response import OllamaClient
 
-SYSTEM_PROMPT = """Ты — Ульяна, менеджер по натяжным потолкам.
+DEFAULT_SYSTEM_PROMPT = """Ты — Ульяна, менеджер по натяжным потолкам.
 Общайся по-русски.
 
 ЖЁСТКИЕ ПРАВИЛА:
@@ -33,6 +33,10 @@ SYSTEM_PROMPT = """Ты — Ульяна, менеджер по натяжным
 5) Если есть акция — можно упомянуть в первом ответе.
 6) Для замера собери: город, адрес, дату, время, телефон.
 7) Не здоровайся повторно, если диалог уже начался.
+
+ВАЖНО:
+- НЕ упоминай доплаты за выезд/расстояние/"за город" и не говори, что цена увеличится из-за расстояния.
+- Если клиент спросил про выезд за город: скажи, что замер бесплатный, а логистику/возможность выезда по дальнему адресу уточнит диспетчер.
 """
 
 
@@ -446,6 +450,13 @@ class AppState:
         self.ollama_timeout = int(ollama_timeout)
         self.ollama = OllamaClient(model=model, timeout=self.ollama_timeout)
 
+        # Позволяем управлять поведением через .env (в проекте уже есть SYSTEM_PROMPT/MAX_HISTORY).
+        self.system_prompt = (os.getenv("SYSTEM_PROMPT") or DEFAULT_SYSTEM_PROMPT).strip()
+        try:
+            self.max_history = int(os.getenv("MAX_HISTORY", "20") or "20")
+        except Exception:
+            self.max_history = 20
+
         self.pricing = PricingEngine("data/pricing_rules.json")
         self.promos = PromotionManager("data/promotions.json")
         self.intents = IntentDetector()
@@ -519,7 +530,7 @@ class AppState:
     def get_history(self, platform: str, user_id: str, mem: Dict[str, Any]) -> ChatHistory:
         k = self._key(platform, user_id)
         if k not in self.histories:
-            h = ChatHistory(SYSTEM_PROMPT, max_messages=20)
+            h = ChatHistory(self.system_prompt, max_messages=self.max_history)
             self._load_history_from_mem(k, h, mem)
             self.histories[k] = h
         return self.histories[k]
@@ -533,7 +544,7 @@ class AppState:
 
     def reset_all(self, platform: str, user_id: str) -> None:
         k = self._key(platform, user_id)
-        self.histories[k] = ChatHistory(SYSTEM_PROMPT, max_messages=20)
+        self.histories[k] = ChatHistory(self.system_prompt, max_messages=self.max_history)
         self.mem_store.reset(k)
 
     def _append_dialog_log(self, platform: str, user_id: str, role: str, text: str) -> None:
@@ -671,10 +682,17 @@ class AppState:
             mem["extras"] = extracted.extras
 
         # эвристика площади: ловим число даже без "кв.м"
+        # ВАЖНО: не подменяем "3 потолка/3 комнаты" на "3 м²" — это ломает диалог.
         cleaned = PHONE_ANY_RE.sub(" ", user_text)
         nums = [int(n) for n in re.findall(r"\b(\d{1,3})\b", cleaned)]
         nums = [n for n in nums if 1 <= n <= 300]
-        if nums and (AREA_HINT_RE.search(cleaned) or detect_price_question(cleaned) or mem.get("asked_area")):
+        has_area_hint = bool(AREA_HINT_RE.search(cleaned) or re.search(r"\bплощад", cleaned, re.IGNORECASE))
+        looks_like_rooms = bool(re.search(r"\b(потолк|комнат|уровн|помещен)\b", cleaned, re.IGNORECASE))
+
+        if nums and has_area_hint:
+            mem["area_m2"] = float(max(nums))
+        elif nums and mem.get("asked_area") and not looks_like_rooms:
+            # пользователь отвечает просто числом на вопрос про площадь
             mem["area_m2"] = float(max(nums))
 
         if platform == "avito":
@@ -802,73 +820,77 @@ class AppState:
 
         # ------------------- 1) расчёт -------------------
         if price_q:
+            # 1) нет города / площади — просим недостающее и выходим (важно: не падать!)
             if not mem.get("city"):
                 mem["asked_city"] = True
                 ans = sanitize_answer(build_need_city(first), allow_greet=first)
-            elif not mem.get("area_m2"):
+
+                history.add_assistant(ans)
+                self._push_dialog(mem, "assistant", ans)
+                mem["_started"] = True
+                self.mem_store.save(k, mem)
+                return ans
+
+            if not mem.get("area_m2"):
                 mem["asked_area"] = True
                 ans = sanitize_answer(build_need_area(first, mem["city"]), allow_greet=first)
-            else:
-                estimate = self.pricing.calculate(
-                    city=mem.get("city"),
-                    area_m2=mem.get("area_m2"),
-                    extras=mem.get("extras") or [],
-                )
-                if getattr(estimate, "min_price", None) is not None:
-                    # после расчёта — предлагаем замер, но если клиент явно "без замера" — спрашиваем мягко
-                    ask_measure = not bool(mem.get("calc_only"))
-                    mem["measure_offer_pending"] = True
-                    ans = build_estimate(
-                        int(estimate.min_price),
-                        city=str(mem["city"]),
-                        area_m2=float(mem["area_m2"]),
-                        ask_measure=ask_measure,
-                    )
-                    ans = sanitize_answer(ans, allow_greet=first)
-                else:
-                    ans = sanitize_answer(build_need_area(first, mem["city"]), allow_greet=first)
 
+                history.add_assistant(ans)
+                self._push_dialog(mem, "assistant", ans)
+                mem["_started"] = True
+                self.mem_store.save(k, mem)
+                return ans
+
+            # 2) считаем ориентир
+            estimate = self.pricing.calculate(
+                city=mem.get("city"),
+                area_m2=mem.get("area_m2"),
+                extras=mem.get("extras") or [],
+            )
+            if getattr(estimate, "min_price", None) is None:
+                mem["asked_area"] = True
+                ans = sanitize_answer(build_need_area(first, mem["city"]), allow_greet=first)
+
+                history.add_assistant(ans)
+                self._push_dialog(mem, "assistant", ans)
+                mem["_started"] = True
+                self.mem_store.save(k, mem)
+                return ans
+
+            minp = int(estimate.min_price)
+            sig = _estimate_signature(mem, minp)
+
+            # 3) если уже недавно давали такой же прайс — не повторяем прайс, а ведём диалог дальше
+            if _is_duplicate_estimate(mem, sig):
+                if detect_materials_question(user_text):
+                    ans = build_materials_vs_turnkey(first)
+                elif "дорог" in (user_text or "").lower():
+                    ans = (
+                        "Понимаю 😊\n"
+                        "Можем сделать дешевле: матовый/сатин, простой профиль и без сложных ниш.\n"
+                        "Хотите — подберу минимальный вариант под ваш бюджет. Сколько светильников планируете?"
+                    )
+                elif detect_measurement_booking_intent(user_text) and not mem.get("calc_only"):
+                    mem["agreed_measurement"] = True
+                    ans = build_measure_intro(first)
+                else:
+                    ans = (
+                        f"{t_hello(first)}Поняла 😊\n"
+                        "Если нужно — уточните допы (светильники/карниз/трубы), и я скорректирую ориентир.\n"
+                        "Либо могу записать на бесплатный замер."
+                    )
+            else:
+                _remember_estimate(mem, sig)
+                # после расчёта — предлагаем замер, но если клиент явно "без замера" — не давим
+                ask_measure = not bool(mem.get("calc_only"))
+                mem["measure_offer_pending"] = True
+                ans = build_estimate(minp, city=str(mem["city"]), area_m2=float(mem["area_m2"]), ask_measure=ask_measure)
+
+            ans = sanitize_answer(ans, allow_greet=first)
             history.add_assistant(ans)
             self._push_dialog(mem, "assistant", ans)
             mem["_started"] = True
             self.mem_store.save(k, mem)
-            minp = int(estimate.min_price)
-            sig = _estimate_signature(mem, minp)
-
-            # если уже недавно давали такой же прайс — не повторяем
-            if _is_duplicate_estimate(mem, sig):
-                # 1) если вопрос "это материалы или под ключ?"
-                if detect_materials_question(user_text):
-                    ans = sanitize_answer(build_materials_vs_turnkey(first), allow_greet=first)
-
-                # 2) если "дорого" — отдельный ответ (если у тебя уже есть build_price_objection — используй его)
-                elif "дорог" in (user_text or "").lower():
-                    ans = sanitize_answer(
-                        "Понимаю 😊\n"
-                        "Можем сделать дешевле: матовый/сатин, простой профиль и без сложных ниш.\n"
-                        "Хотите — подберу минимальный вариант под ваш бюджет. Сколько светильников планируете?",
-                        allow_greet=first,
-                    )
-
-                # 3) если спрашивает про замер/выезд
-                elif detect_measurement_booking_intent(user_text):
-                    mem["agreed_measurement"] = True
-                    ans = sanitize_answer(build_measure_intro(first), allow_greet=first)
-
-                # 4) иначе просто не повторяем прайс, а задаём один уточняющий вопрос
-                else:
-                    ans = sanitize_answer(
-                        f"{t_hello(first)}Поняла 😊\n"
-                        "Если нужно — уточните допы (светильники/карниз/трубы), и я скорректирую ориентир.\n"
-                        "Либо могу записать на бесплатный замер.",
-                        allow_greet=first,
-                    )
-
-            else:
-                _remember_estimate(mem, sig)
-                ans = build_estimate(minp, city=str(mem["city"]), area_m2=float(mem["area_m2"]),
-                                     ask_measure=not bool(mem.get("calc_only")))
-                ans = sanitize_answer(ans, allow_greet=first)
             return ans
 
 

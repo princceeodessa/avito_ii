@@ -72,7 +72,16 @@ class DebouncedReply:
         # промо-маркер
         if reply.startswith("__PROMO_IMAGE__\n"):
             text = reply.split("\n", 1)[1].strip()
-            promo_path = os.getenv("TG_PROMO_IMAGE_PATH", "data/promo_tg.png")
+            promo_path = os.getenv("TG_PROMO_IMAGE_PATH", "data/promo_tg.jpg")
+            # совместимость: если по умолчанию jpg отсутствует, пробуем png (и наоборот)
+            if not os.path.exists(promo_path):
+                alt = promo_path
+                if alt.lower().endswith(".jpg"):
+                    alt = alt[:-4] + ".png"
+                elif alt.lower().endswith(".png"):
+                    alt = alt[:-4] + ".jpg"
+                if os.path.exists(alt):
+                    promo_path = alt
             if os.path.exists(promo_path):
                 await self.bot.send_photo(chat_id=message.chat.id, photo=FSInputFile(promo_path), caption=text)
             else:
@@ -88,18 +97,30 @@ async def run_telegram(
     callcenter_chat_id: str = "",
     debounce_delay: float = 1.2,
 ) -> None:
+    bot_token = (bot_token or "").strip()
+    if not bot_token or ":" not in bot_token:
+        raise RuntimeError("Telegram bot token is empty/invalid. Set TELEGRAM_TOKEN (or BOT_TOKEN).")
+
     bot = Bot(token=bot_token)
     dp = Dispatcher()
     router = Router()
 
     callcenter_chat_id = (callcenter_chat_id or "").strip()
+    callcenter_chat_id_int = None
+    if callcenter_chat_id:
+        try:
+            callcenter_chat_id_int = int(callcenter_chat_id)
+        except Exception:
+            print(f"[tg] CALLCENTER_CHAT_ID is not an int: {callcenter_chat_id!r}")
 
     async def notify_coro(text: str) -> None:
-        if not callcenter_chat_id:
+        if not callcenter_chat_id_int:
             return
         try:
-            await bot.send_message(chat_id=int(callcenter_chat_id), text=text)
-        except Exception:
+            await bot.send_message(chat_id=callcenter_chat_id_int, text=text)
+        except Exception as e:
+            # важно: не молчим, иначе кажется что "заявки не прилетают"
+            print(f"[tg] notify_coro error: {e}")
             return
 
     state.set_notifier(asyncio.get_running_loop(), notify_coro)

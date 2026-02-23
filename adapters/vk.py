@@ -127,17 +127,6 @@ class DebouncedReply:
 
 
 async def run_vk(state: AppState) -> None:
-    """
-    VK Group LongPoll adapter.
-
-    ENV:
-    - VK_GROUP_TOKEN
-    - VK_GROUP_ID
-    - VK_TEST_USER_ID  (только этот юзер получает ответы)
-    - VK_DEBUG=1
-    - VK_DEBOUNCE_DELAY=1.2
-    - VK_POLL_WAIT=25
-    """
 
     token = os.getenv("VK_GROUP_TOKEN", "").strip()
     group_id = parse_int_env("VK_GROUP_ID", 0)
