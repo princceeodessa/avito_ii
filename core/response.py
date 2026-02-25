@@ -9,7 +9,7 @@ class OllamaClient:
     def __init__(
         self,
         base_url: Optional[str] = None,
-        model: str = "llama3",
+        model: str = "qwen2.5:7b",
         timeout: int = 120,
         request_timeout: Optional[int] = None,  # совместимость со старым именем, если было
     ):

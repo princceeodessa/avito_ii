@@ -23,16 +23,40 @@ EXTRA_ALIASES = {
 
 
 def extract_area_m2(text: str) -> Optional[float]:
-    t = text.lower().replace(",", ".")
-    # "20 м2", "20м2", "20 кв м", "20 квадратов"
-    m = re.search(r"(\d+(?:\.\d+)?)\s*(?:м2|м\^2|кв\.?\s*м|квадрат)", t)
+    """Пробует извлечь площадь из текста.
+
+    Поддерживает варианты:
+    - 20 м2 / 20м2 / 20 м^2 / 20 м²
+    - 20 кв м / 20 кв.м / 20кв.м / 20 кв
+    - 20 квадратов / 20 квадратных метров
+    - диапазоны: 20-25 кв (берём верхнюю границу, чтобы не занижать ориентир)
+    """
+    t = (text or "").lower().replace(",", ".")
+
+    unit = r"(?:м2|м\^2|м²|кв\.?\s*м|кв\.?\s*метр(?:а|ов)?|квадратн\w*\s*метр(?:а|ов)?|квадрат(?:а|ов)?|кв\.?\b|квм\b)"
+
+    # 1) диапазон 20-25 кв.м
+    m = re.search(rf"(\d{{1,3}}(?:\.\d+)?)\s*[\-–—]\s*(\d{{1,3}}(?:\.\d+)?)\s*{unit}", t)
+    if m:
+        try:
+            a = float(m.group(1))
+            b = float(m.group(2))
+            val = max(a, b)
+            if 3 <= val <= 300:
+                return val
+        except Exception:
+            return None
+
+    # 2) одиночное значение 20кв / 20 кв.м / 20 м²
+    m = re.search(rf"(\d{{1,3}}(?:\.\d+)?)\s*{unit}", t)
     if m:
         try:
             val = float(m.group(1))
             if 3 <= val <= 300:  # разумный фильтр
                 return val
-        except:
+        except Exception:
             return None
+
     return None
 
 def extract_extras(text: str) -> List[str]:

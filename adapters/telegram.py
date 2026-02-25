@@ -61,7 +61,7 @@ class DebouncedReply:
             # чтобы TG не молчал при падении LLM
             await self.bot.send_message(
                 chat_id=message.chat.id,
-                text="Сервис ответа сейчас занят 😕 Попробуйте ещё раз через 10–20 секунд.",
+                text="Сервис ответа сейчас занят 😕 Сообщение получил. Если ответа не будет — напишите «+».",
             )
             print(f"[tg] generate_reply error: {e}")
             return

@@ -13,11 +13,12 @@ HUMAN_TRIGGERS = [
     "позови", "позовите", "соедини", "соедините", "не бот",
     "хочу человека", "переключи на человека",
 ]
-
-# ✅ Тема "натяжные потолки" — по этим словам считаем, что это наш клиент.
-CEILING_KEYWORDS = [
-    "потол", "натяж", "светиль", "люстр", "профил", "тенев",
-    "карниз", "замер", "м2", "м²", "кв",
+SERVICE_KEYWORDS = [
+    # потолки
+    "потол", "натяж", "светиль", "люстр", "профил", "тенев", "карниз", "замер",
+    "м2", "м²", "кв",
+    # шумоизоляция
+    "шумо", "звуко", "изоляц", "акуст", "войлок", "мембран",
 ]
 
 
@@ -122,6 +123,11 @@ async def run_avito_poller(state: AppState) -> None:
         token_path=token_path,
     )
 
+    # ✅ На старте НЕ отвечаем на старые сообщения.
+    # Идея: делаем "снимок" последних входящих сообщений по всем чатам и сохраняем их как уже обработанные.
+    # Тогда бот будет отвечать только на новые сообщения, которые появятся ПОСЛЕ запуска.
+    ignore_backlog_on_start = os.getenv("AVITO_IGNORE_BACKLOG_ON_START", "1") == "1"
+
     async def token_refresher():
         while True:
             await asyncio.sleep(23 * 3600)
@@ -133,6 +139,34 @@ async def run_avito_poller(state: AppState) -> None:
     asyncio.create_task(token_refresher())
 
     print("[avito_poller] mode: LAST_MESSAGE (GET messages is not available: 405/404)")
+
+    if ignore_backlog_on_start:
+        try:
+            await asyncio.to_thread(api.ensure_token)
+            chats0 = await asyncio.to_thread(api.list_chats, 100, 0)
+            boot_cnt = 0
+            for ch0 in chats0:
+                chat_id0 = _pick_chat_id(ch0)
+                if not chat_id0:
+                    continue
+                last0 = _get_last_message(ch0)
+                if not last0:
+                    continue
+                mid0 = _msg_id(last0)
+                txt0 = _msg_text(last0)
+                incoming0 = _is_incoming(last0, user_id)
+                if not mid0 or not txt0 or not incoming0:
+                    continue
+
+                k0 = f"avito:{chat_id0}"
+                mem0: Dict[str, Any] = state.mem_store.load(k0)
+                mem0["avito_last_in_mid"] = mid0
+                state.mem_store.save(k0, mem0)
+                boot_cnt += 1
+
+            print(f"[avito_poller] bootstrap: ignored backlog for {boot_cnt} chats")
+        except Exception as e:
+            print(f"[avito_poller] bootstrap error: {e}")
 
     while True:
         try:
@@ -180,11 +214,11 @@ async def run_avito_poller(state: AppState) -> None:
                 # Теперь отвечаем на любые чаты, если тема похожа на натяжные потолки:
                 # - по тексту сообщения
                 # - или по заголовку объявления (если он есть)
-                if not (_contains_any(text, CEILING_KEYWORDS) or _contains_any(title, CEILING_KEYWORDS)):
+                if not (_contains_any(text, SERVICE_KEYWORDS) or _contains_any(title, SERVICE_KEYWORDS)):
                     mem_before["avito_last_in_mid"] = mid
                     state.mem_store.save(k, mem_before)
                     if debug:
-                        print("[TRACE] skip: not ceiling topic")
+                        print("[TRACE] skip: not our service topic")
                     continue
 
                 now = time.time()
@@ -211,7 +245,7 @@ async def run_avito_poller(state: AppState) -> None:
                         f"Сообщение:\n{text}"
                     )
                     try:
-                        await asyncio.to_thread(api.send_text, chat_id, "Понял(а) ✅ Передал(а) менеджеру — он ответит вам в этом чате.")
+                        await asyncio.to_thread(api.send_text, chat_id, "Поняла ✅ Передала менеджеру — он ответит вам чате.")
                     except Exception:
                         pass
                     continue

@@ -8,12 +8,6 @@ from typing import Any, Dict, Optional
 
 
 class LeadStoreTxt:
-    """
-    Пишем:
-    1) data/leads.txt (короткая строка)
-    2) data/leads/<lead_...>.json (полная карточка)  -> возвращаем путь (для email/вложений)
-    """
-
     def __init__(self, path: str = "data/leads.txt", leads_dir: str = "data/leads") -> None:
         self.path = path
         self.leads_dir = leads_dir
@@ -42,7 +36,7 @@ class LeadStoreTxt:
             f"user_id={lead.get('user_id','?')} "
             f"username={lead.get('username','-')} "
             f"name={lead.get('name','-')} "
-            f"lead_kind={lead.get('lead_kind','-')} "
+            f"lead_kind={lead.get('lead_kind','-')} "f"service={lead.get('service','-')} "
             f"city={lead.get('city','?')} "
             f"area_m2={lead.get('area_m2','?')} "
             f"extras={lead.get('extras','-')} "
@@ -54,7 +48,6 @@ class LeadStoreTxt:
         with open(self.path, "a", encoding="utf-8") as f:
             f.write(line)
 
-        # 2) json card
         fname = f"lead_{ts}_{platform}_{user_id}_{city}.json"
         fpath = str(Path(self.leads_dir) / fname)
         with open(fpath, "w", encoding="utf-8") as f:

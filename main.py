@@ -24,7 +24,7 @@ def log_task_result(t: asyncio.Task) -> None:
 async def main():
     load_dotenv()
 
-    model = os.getenv("OLLAMA_MODEL", "llama3")
+    model = os.getenv("OLLAMA_MODEL", "qwen2.5:7b")
     ollama_timeout = int(os.getenv("OLLAMA_TIMEOUT", "240") or "240")
     state = AppState(model=model, ollama_timeout=ollama_timeout)
 
@@ -45,12 +45,12 @@ async def main():
         t.add_done_callback(log_task_result)
         tasks.append(t)
 
-    if os.getenv("ENABLE_AVITO", "0") == "1":
+    if os.getenv("ENABLE_AVITO", "0") == "0":
         t = asyncio.create_task(run_avito_poller(state), name="avito")
         t.add_done_callback(log_task_result)
         tasks.append(t)
 
-    if os.getenv("ENABLE_VK", "0") == "1":
+    if os.getenv("ENABLE_VK", "0") == "0":
         t = asyncio.create_task(run_vk(state), name="vk")
         t.add_done_callback(log_task_result)
         tasks.append(t)
