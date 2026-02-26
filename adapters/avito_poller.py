@@ -13,13 +13,29 @@ HUMAN_TRIGGERS = [
     "позови", "позовите", "соедини", "соедините", "не бот",
     "хочу человека", "переключи на человека",
 ]
-SERVICE_KEYWORDS = [
+# Важно: НЕ используем слабые триггеры ("кв", "м²", "замер") для определения темы.
+# Они встречаются в куче нецелевых чатов ("квартира", "кв. м" и т.п.) и запускают спам.
+STRONG_SERVICE_KEYWORDS = [
     # потолки
-    "потол", "натяж", "светиль", "люстр", "профил", "тенев", "карниз", "замер",
-    "м2", "м²", "кв",
+    "потол", "натяж", "светиль", "люстр", "профил", "тенев", "карниз",
     # шумоизоляция
     "шумо", "звуко", "изоляц", "акуст", "войлок", "мембран",
 ]
+
+
+def _parse_csv_env(name: str) -> List[str]:
+    raw = (os.getenv(name, "") or "").strip()
+    if not raw:
+        return []
+    parts = [p.strip() for p in raw.split(",")]
+    return [p for p in parts if p]
+
+
+def _title_allowed(title: str, allowed: List[str]) -> bool:
+    if not allowed:
+        return True
+    t = _norm(title)
+    return any(_norm(a) in t for a in allowed)
 
 
 def _norm(s: str) -> str:
@@ -109,6 +125,11 @@ async def run_avito_poller(state: AppState) -> None:
 
     debug = os.getenv("AVITO_DEBUG", "0") == "1"
 
+    # ✅ Опционально: allowlist по заголовкам объявлений.
+    # Пример в .env:
+    # AVITO_ALLOWED_TITLES=Натяжные потолки в Ижевске,Шумоизоляция и звукоизоляция под ключ
+    allowed_titles = _parse_csv_env("AVITO_ALLOWED_TITLES")
+
     # ⚠️ Если у тебя в .env было AVITO_TRACE_CHAT_ID — оно режет всё до одного чата.
     # Оставляем как "отладочный" флаг, но если хочешь отвечать всем — просто не задавай его.
     trace_chat_id = os.getenv("AVITO_TRACE_CHAT_ID", "").strip()
@@ -143,26 +164,37 @@ async def run_avito_poller(state: AppState) -> None:
     if ignore_backlog_on_start:
         try:
             await asyncio.to_thread(api.ensure_token)
-            chats0 = await asyncio.to_thread(api.list_chats, 100, 0)
             boot_cnt = 0
-            for ch0 in chats0:
-                chat_id0 = _pick_chat_id(ch0)
-                if not chat_id0:
-                    continue
-                last0 = _get_last_message(ch0)
-                if not last0:
-                    continue
-                mid0 = _msg_id(last0)
-                txt0 = _msg_text(last0)
-                incoming0 = _is_incoming(last0, user_id)
-                if not mid0 or not txt0 or not incoming0:
-                    continue
+            limit = 100
+            offset = 0
+            # ⚠️ Важно: на аккаунте может быть >100 чатов.
+            # Пролистываем все страницы, иначе бот «догонит» историю и будет спамить.
+            while True:
+                chats0 = await asyncio.to_thread(api.list_chats, limit, offset)
+                if not chats0:
+                    break
+                for ch0 in chats0:
+                    chat_id0 = _pick_chat_id(ch0)
+                    if not chat_id0:
+                        continue
+                    last0 = _get_last_message(ch0)
+                    if not last0:
+                        continue
+                    mid0 = _msg_id(last0)
+                    txt0 = _msg_text(last0)
+                    incoming0 = _is_incoming(last0, user_id)
+                    if not mid0 or not txt0 or not incoming0:
+                        continue
 
-                k0 = f"avito:{chat_id0}"
-                mem0: Dict[str, Any] = state.mem_store.load(k0)
-                mem0["avito_last_in_mid"] = mid0
-                state.mem_store.save(k0, mem0)
-                boot_cnt += 1
+                    k0 = f"avito:{chat_id0}"
+                    mem0: Dict[str, Any] = state.mem_store.load(k0)
+                    mem0["avito_last_in_mid"] = mid0
+                    state.mem_store.save(k0, mem0)
+                    boot_cnt += 1
+
+                if len(chats0) < limit:
+                    break
+                offset += limit
 
             print(f"[avito_poller] bootstrap: ignored backlog for {boot_cnt} chats")
         except Exception as e:
@@ -171,109 +203,130 @@ async def run_avito_poller(state: AppState) -> None:
     while True:
         try:
             await asyncio.to_thread(api.ensure_token)
-            chats = await asyncio.to_thread(api.list_chats, 100, 0)
+            # Листаем все страницы, иначе новые сообщения в «дальних» чатах не будут обрабатываться.
+            limit = 100
+            offset = 0
+            total = 0
+            while True:
+                chats = await asyncio.to_thread(api.list_chats, limit, offset)
+                if not chats:
+                    break
+                total += len(chats)
 
-            if debug:
-                print(f"[avito_poller] tick: chats={len(chats)}")
+                if debug and offset == 0:
+                    print(f"[avito_poller] tick: first_page_chats={len(chats)}")
 
-            for ch in chats:
-                chat_id = _pick_chat_id(ch)
-                if not chat_id:
-                    continue
+                for ch in chats:
+                    chat_id = _pick_chat_id(ch)
+                    if not chat_id:
+                        continue
 
-                # ✅ Отладка (по умолчанию пусто). Если заполнено — режет до одного чата.
-                if trace_chat_id and chat_id != trace_chat_id:
-                    continue
+                    # ✅ Отладка (по умолчанию пусто). Если заполнено — режет до одного чата.
+                    if trace_chat_id and chat_id != trace_chat_id:
+                        continue
 
-                last = _get_last_message(ch)
-                if not last:
-                    continue
+                    last = _get_last_message(ch)
+                    if not last:
+                        continue
 
-                mid = _msg_id(last)
-                text = _msg_text(last)
-                incoming = _is_incoming(last, user_id)
+                    mid = _msg_id(last)
+                    text = _msg_text(last)
+                    incoming = _is_incoming(last, user_id)
 
-                if not text or not mid or not incoming:
-                    continue
+                    # отвечаем ТОЛЬКО на новые входящие от клиента
+                    if not text or not mid or not incoming:
+                        continue
 
-                k = f"avito:{chat_id}"
+                    k = f"avito:{chat_id}"
+                    mem_before: Dict[str, Any] = state.mem_store.load(k)
 
-                # ✅ Проверка дубля
-                mem_before: Dict[str, Any] = state.mem_store.load(k)
-                if str(mem_before.get("avito_last_in_mid") or "") == mid:
-                    continue
+                    # ✅ анти-дубль: уже обработали этот incoming
+                    if str(mem_before.get("avito_last_in_mid") or "") == mid:
+                        continue
 
-                meta = _extract_meta(ch)
-                title = meta.get("title", "")
+                    meta = _extract_meta(ch)
+                    title = meta.get("title", "")
 
-                if debug:
-                    print(f"[TRACE] chat={chat_id} title='{title}' last_id={mid} in={incoming} text={text!r}")
+                    # ✅ Allowlist по объявлениям (если задано)
+                    if title and not _title_allowed(title, allowed_titles):
+                        mem_before["avito_last_in_mid"] = mid
+                        state.mem_store.save(k, mem_before)
+                        if debug:
+                            print("[TRACE] skip: title not allowed")
+                        continue
 
-                # ✅ Главное изменение:
-                # Раньше был фильтр "только по конкретным заголовкам объявлений".
-                # Теперь отвечаем на любые чаты, если тема похожа на натяжные потолки:
-                # - по тексту сообщения
-                # - или по заголовку объявления (если он есть)
-                if not (_contains_any(text, SERVICE_KEYWORDS) or _contains_any(title, SERVICE_KEYWORDS)):
-                    mem_before["avito_last_in_mid"] = mid
-                    state.mem_store.save(k, mem_before)
                     if debug:
-                        print("[TRACE] skip: not our service topic")
-                    continue
+                        print(f"[TRACE] chat={chat_id} title='{title}' last_id={mid} in={incoming} text={text!r}")
 
-                now = time.time()
-                manual_until = float(mem_before.get("manual_until") or 0)
+                    # ✅ Тема: только по «сильным» ключам
+                    if not (_contains_any(text, STRONG_SERVICE_KEYWORDS) or _contains_any(title, STRONG_SERVICE_KEYWORDS)):
+                        mem_before["avito_last_in_mid"] = mid
+                        state.mem_store.save(k, mem_before)
+                        if debug:
+                            print("[TRACE] skip: not our service topic")
+                        continue
 
-                if manual_until > now:
-                    mem_before["avito_last_in_mid"] = mid
-                    state.mem_store.save(k, mem_before)
-                    continue
+                    now = time.time()
+                    manual_until = float(mem_before.get("manual_until") or 0)
+                    if manual_until > now:
+                        mem_before["avito_last_in_mid"] = mid
+                        state.mem_store.save(k, mem_before)
+                        continue
 
-                if _contains_any(text, HUMAN_TRIGGERS):
-                    mem_before["manual_until"] = now + manual_hours * 3600
-                    mem_before["manual_started_at"] = now
-                    mem_before["manual_reason"] = "client_requested_human"
-                    mem_before["avito_last_in_mid"] = mid
-                    state.mem_store.save(k, mem_before)
+                    # 🆘 запрос менеджера
+                    if _contains_any(text, HUMAN_TRIGGERS):
+                        mem_before["manual_until"] = now + manual_hours * 3600
+                        mem_before["manual_started_at"] = now
+                        mem_before["manual_reason"] = "client_requested_human"
+                        mem_before["avito_last_in_mid"] = mid
+                        state.mem_store.save(k, mem_before)
 
-                    link = meta.get("chat_url") or meta.get("item_url") or "https://www.avito.ru/profile/messenger"
-                    state.notify_now(
-                        "🆘 Клиент просит менеджера (Авито)\n"
-                        f"Chat ID: {chat_id}\n"
-                        f"Объявление: {title or '-'}\n"
-                        f"Ссылка: {link}\n"
-                        f"Сообщение:\n{text}"
+                        link = meta.get("chat_url") or meta.get("item_url") or "https://www.avito.ru/profile/messenger"
+                        state.notify_now(
+                            "🆘 Клиент просит менеджера (Авито)\n"
+                            f"Chat ID: {chat_id}\n"
+                            f"Объявление: {title or '-'}\n"
+                            f"Ссылка: {link}\n"
+                            f"Сообщение:\n{text}"
+                        )
+                        try:
+                            await asyncio.to_thread(api.send_text, chat_id, "Поняла ✅ Передала менеджеру — он ответит вам в чате.")
+                        except Exception:
+                            pass
+                        continue
+
+                    # ✅ Генерация ответа
+                    reply = await asyncio.to_thread(
+                        state.generate_reply,
+                        "avito",
+                        chat_id,
+                        text,
+                        meta,
                     )
+
+                    if reply and reply.strip():
+                        try:
+                            await asyncio.to_thread(api.send_text, chat_id, reply)
+                        except Exception as e:
+                            print(f"[avito_poller] send error: {e}")
+
                     try:
-                        await asyncio.to_thread(api.send_text, chat_id, "Поняла ✅ Передала менеджеру — он ответит вам чате.")
+                        await asyncio.to_thread(api.mark_read, chat_id)
                     except Exception:
                         pass
-                    continue
 
-                # ✅ Генерация ответа
-                reply = await asyncio.to_thread(
-                    state.generate_reply,
-                    "avito",
-                    chat_id,
-                    text,
-                    meta,
-                )
+                    # ✅ Запоминаем последний входящий mid
+                    mem_after: Dict[str, Any] = state.mem_store.load(k)
+                    mem_after["avito_last_in_mid"] = mid
+                    state.mem_store.save(k, mem_after)
 
-                if reply and reply.strip():
-                    try:
-                        await asyncio.to_thread(api.send_text, chat_id, reply)
-                    except Exception as e:
-                        print(f"[avito_poller] send error: {e}")
+                # pagination
+                if len(chats) < limit:
+                    break
+                offset += limit
 
-                try:
-                    await asyncio.to_thread(api.mark_read, chat_id)
-                except Exception:
-                    pass
-
-                # ✅ Запоминаем последний входящий mid
-                mem_after: Dict[str, Any] = state.mem_store.load(k)
-                mem_after["avito_last_in_mid"] = mid
-                state.mem_store.save(k, mem_after)
+            if debug:
+                print(f"[avito_poller] tick done: chats_scanned={total}")
 
         except Exception as e:
             print(f"[avito_poller] LOOP ERROR: {e}")

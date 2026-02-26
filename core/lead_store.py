@@ -55,3 +55,19 @@ class LeadStoreTxt:
 
         self.last_path = fpath
         return fpath
+
+
+class LeadStoreJsonl:
+    """Append-only store for lead events.
+
+    We don't try to rewrite old leads; instead we emit events with a stable lead_key.
+    This makes reschedules/edits traceable and keeps the implementation simple.
+    """
+
+    def __init__(self, path: str = "data/leads_events.jsonl") -> None:
+        self.path = path
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+
+    def append(self, event: Dict[str, Any]) -> None:
+        with open(self.path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(event, ensure_ascii=False) + "\n")

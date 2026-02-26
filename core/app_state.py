@@ -11,7 +11,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 from core.extractor import extract_info
 from core.history import ChatHistory
 from core.intent import IntentDetector
-from core.lead_store import LeadStoreTxt
+from core.lead_store import LeadStoreTxt, LeadStoreJsonl
 from core.memory_store import FileKVStore
 from core.fewshot import FewShotManager
 from core.pricing import PricingEngine
@@ -222,6 +222,21 @@ def detect_measurement_decline(text: str) -> bool:
 def detect_calc_only(text: str) -> bool:
     return bool(CALC_ONLY_RE.search(text or ""))
 
+
+# запрос живого человека / оператора
+HANDOFF_RE = re.compile(
+    r"(позов(и|ите)|соедини(те)?|нужен\s+оператор|оператор|менеджер|жив(ой|ого)\s+человек|человека\s+позови|позови\s+человека|позови\s+менеджера|позови\s+оператора|позови\s+ассистента|передай\s+человеку)",
+    re.IGNORECASE,
+)
+
+def detect_handoff_request(text: str) -> bool:
+    if not text:
+        return False
+    t = text.strip()
+    # если человек пишет "не хочу замер, позови ассистента" — это точно handoff
+    return bool(HANDOFF_RE.search(t))
+
+
 AFFIRM_RE = re.compile(r"\b(да|ок|хорошо|давайте|согласен|согласна|подтверждаю|записывайте)\b", re.IGNORECASE)
 NEG_RE = re.compile(r"\b(нет|не надо|не нужно|отмена|передумал|передумала)\b", re.IGNORECASE)
 def detect_affirm(text: str) -> bool:
@@ -354,11 +369,16 @@ def extract_address(text: str) -> Optional[str]:
         return None
     if AREA_HINT_RE.search(t):
         return None
+    # «после 2», «до обеда», «после обеда» и т.п. — это про время, не про адрес
+    if re.search(r"\b(после|до)\b", low) and re.search(r"\d", low):
+        return None
+    if re.search(r"\b(обед|утром|вечером|днем|дн[её]м)\b", low):
+        return None
     # если есть подсказки адреса — берём
     if ADDRESS_HINT_RE.search(t) and re.search(r"\d", t):
         return t
-    # или если просто "ворошилова 4"
-    if re.search(r"[А-Яа-яЁё]", t) and re.search(r"\d", t) and len(t) <= 80:
+    # или если просто "ворошилова 4" (но не "после 2")
+    if re.search(r"[А-Яа-яЁё]{3,}", t) and re.search(r"\d", t) and len(t) <= 80:
         return t
     return None
 
@@ -614,6 +634,9 @@ class AppState:
             leads_dir=_abs(os.getenv("LEADS_DIR", "data/leads")),
         )
 
+        # События по лидам (обновления, переносы времени, уточнения) — append-only.
+        self.lead_events = LeadStoreJsonl(_abs(os.getenv("LEADS_EVENTS_PATH", "data/leads_events.jsonl")))
+
         # Few-shot (быстрый способ улучшить стиль/воронку без обучения модели)
         self.fewshot = FewShotManager(_abs(os.getenv("FEWSHOT_PATH", "data/fewshot/ulyana_fewshot.json")))
         try:
@@ -785,6 +808,30 @@ class AppState:
 
         lead_file_path = self.leads.append(lead)
         mem["lead_created"] = True
+        # снапшот для последующих обновлений (перенос времени, уточнение адреса и т.д.)
+        mem["lead_key"] = f"{platform}:{user_id}:measure"
+        mem["lead_snapshot"] = {
+            "city": lead.get("city"),
+            "area_m2": lead.get("area_m2"),
+            "extras": lead.get("extras"),
+            "address": lead.get("address"),
+            "visit_date": lead.get("visit_date"),
+            "visit_time": lead.get("visit_time"),
+            "phone": lead.get("phone"),
+        }
+        try:
+            self.lead_events.append(
+                {
+                    "ts": int(time.time()),
+                    "event": "measure_create",
+                    "lead_key": mem.get("lead_key"),
+                    "platform": platform,
+                    "user_id": user_id,
+                    "snapshot": mem.get("lead_snapshot"),
+                }
+            )
+        except Exception:
+            pass
 
         uname = f"@{lead['username']}" if lead.get("username") else "-"
         lead_text = (
@@ -873,6 +920,83 @@ class AppState:
         except Exception:
             return
 
+    def _maybe_update_measure_lead(self, platform: str, user_id: str, mem: Dict[str, Any], meta: Dict[str, Any]) -> None:
+        """If a measure lead was already created, send an update when key fields changed.
+
+        This fixes the "lead doesn't update after reschedule" issue.
+        """
+        if not mem.get("lead_created"):
+            return
+
+        prev = mem.get("lead_snapshot")
+        cur = {
+            "city": mem.get("city"),
+            "area_m2": mem.get("area_m2"),
+            "extras": mem.get("extras"),
+            "address": mem.get("address"),
+            "visit_date": resolve_relative_date(mem.get("visit_date") or ""),
+            "visit_time": mem.get("visit_time"),
+            "phone": mem.get("phone") if not mem.get("no_phone") else None,
+        }
+
+        # first time snapshot might be missing (compat with old mem)
+        if not isinstance(prev, dict):
+            mem["lead_snapshot"] = cur
+            mem["lead_key"] = mem.get("lead_key") or f"{platform}:{user_id}:measure"
+            return
+
+        changed = {k: (prev.get(k), cur.get(k)) for k in cur.keys() if prev.get(k) != cur.get(k)}
+        if not changed:
+            return
+
+        # anti-spam
+        last_ts = float(mem.get("lead_update_ts") or 0)
+        if (time.time() - last_ts) < 15:
+            mem["lead_snapshot"] = cur
+            return
+
+        mem["lead_update_ts"] = time.time()
+        mem["lead_snapshot"] = cur
+
+        def _fmt(v):
+            return "-" if v in (None, "", [], {}) else v
+
+        uname = f"@{meta.get('username')}" if meta.get("username") else "-"
+        lines = []
+        ru = {
+            "city": "Город",
+            "area_m2": "Площадь",
+            "extras": "Допы",
+            "address": "Адрес",
+            "visit_date": "Дата",
+            "visit_time": "Время",
+            "phone": "Телефон",
+        }
+        for k, (a, b) in changed.items():
+            lines.append(f"{ru.get(k,k)}: {_fmt(a)} → {_fmt(b)}")
+
+        self.notify_now(
+            "🛠 Обновление заявки на замер\n"
+            f"Платформа: {platform}\n"
+            f"User ID: {user_id}\n"
+            f"Username: {uname}\n"
+            + "\n".join(lines)
+        )
+
+        try:
+            self.lead_events.append(
+                {
+                    "ts": int(time.time()),
+                    "event": "measure_update",
+                    "lead_key": mem.get("lead_key") or f"{platform}:{user_id}:measure",
+                    "platform": platform,
+                    "user_id": user_id,
+                    "changed": changed,
+                }
+            )
+        except Exception:
+            pass
+
 
     # ---------- public API ----------
     def generate_reply(
@@ -893,6 +1017,71 @@ class AppState:
         user_text = (user_text or "").strip()
         if not user_text:
             return ""
+
+        
+        # --- запрос живого человека / оператора ---
+        if detect_handoff_request(user_text):
+            # сбрасываем любые "анкеты замера", чтобы не продолжать спрашивать время/адрес
+            mem["measure_offer_pending"] = False
+            mem["agreed_measurement"] = False
+            mem["handoff_requested"] = True
+
+            # событие для трекинга
+            try:
+                lead_key = mem.get("lead_key") or f"{platform}:{user_id}"
+                mem["lead_key"] = lead_key
+                self.lead_events.append(
+                    {
+                        "ts": int(time.time()),
+                        "event": "handoff_request",
+                        "lead_key": lead_key,
+                        "platform": platform,
+                        "user_id": user_id,
+                        "username": meta.get("username"),
+                        "name": meta.get("name"),
+                        "text": user_text,
+                        "service": mem.get("service"),
+                        "city": mem.get("city"),
+                        "area_m2": mem.get("area_m2"),
+                    }
+                )
+            except Exception:
+                pass
+
+            def _platform_label(p: str) -> str:
+                p = (p or "").lower()
+                return {
+                    "tg": "TG",
+                    "telegram": "TG",
+                    "avito": "Авито",
+                    "vk": "VK",
+                }.get(p, p or "-")
+            # уведомление в менеджерский чат
+            try:
+                uname = f"@{meta.get('username')}" if meta.get("username") else "-"
+                header = f"🆘 Просьба подключить менеджера ({_platform_label(platform)})"
+                link = meta.get("link") or ("https://www.avito.ru/profile/messenger" if platform == "avito" else "-")
+                self.notify_now(
+                    f"{header}\n"
+                    f"ID: {user_id}\n"
+                    f"Username: {uname}\n"
+                    f"Имя: {meta.get('name') or '-'}\n"
+                    f"Товар: {mem.get('service') or '-'}\n"
+                    f"Город: {mem.get('city') or '-'}\n"
+                    f"Площадь: {mem.get('area_m2') or '-'}\n"
+                    f"Телефон: {mem.get('phone') or '-'}\n"
+                    f"Ссылка: {link}\n"
+                    f"Текст: {user_text}"
+                )
+            except Exception:
+                pass
+
+            self.mem_store.save(k, mem)
+            return (
+                "Поняла вас 😊 Подключу менеджера.\n"
+                "Пока он подключается, напишите, пожалуйста, одним сообщением: город и что нужно (потолок/шумоизоляция/расчёт).\n"
+                "Если не хотите оставлять телефон — можно просто ваш @ник, чтобы с вами связались."
+            )
 
         wants_greet = detect_greeting(user_text) or detect_greeting_request(user_text)
         greet = first or wants_greet
@@ -989,12 +1178,54 @@ class AppState:
         hot_intent = detect_measurement_booking_intent(user_text) or detect_affirm(user_text)
         hot_discount = detect_discount_mention(user_text) and bool(mem.get("area_m2") and mem.get("city"))
 
+        def _platform_label(p: str) -> str:
+            p = (p or "").lower()
+            return {
+                "avito": "Авито",
+                "tg": "TG",
+                "telegram": "TG",
+                "vk": "VK",
+                "whatsapp": "WA",
+            }.get(p, p or "-")
+
+        def _lead_key() -> str:
+            # service важен: у одного user_id могут быть разные товары/воронки
+            return f"{platform}:{user_id}:{mem.get('service') or 'unknown'}"
+
+        def _snapshot() -> Dict[str, Any]:
+            return {
+                "city": mem.get("city"),
+                "area_m2": mem.get("area_m2"),
+                "address": mem.get("address"),
+                "visit_date": mem.get("visit_date"),
+                "visit_time": mem.get("visit_time"),
+                "phone": mem.get("phone"),
+                "extras": mem.get("extras"),
+                "service": mem.get("service"),
+                "username": meta.get("username"),
+                "name": meta.get("name"),
+            }
+
+        # 1) Первое уведомление "горячий" — platform-aware.
         if (hot_intent or hot_fields >= 2 or hot_discount) and not mem.get("hot_notified"):
             mem["hot_notified"] = True
-            link = meta.get("chat_url") or meta.get("item_url") or "https://www.avito.ru/profile/messenger"
+            mem["hot_lead_key"] = _lead_key()
+            mem["hot_snapshot"] = _snapshot()
+
+            link = meta.get("chat_url") or meta.get("item_url")
+            if platform != "avito":
+                link = link or "-"
+            else:
+                link = link or "https://www.avito.ru/profile/messenger"
+
+            uname = f"@{meta.get('username')}" if meta.get("username") else "-"
+            header = f"🔥 Горячий интерес ({_platform_label(platform)})"
             self.notify_now(
-                "🔥 Горячий интерес (Авито)\n"
-                f"Chat ID: {user_id}\n"
+                f"{header}\n"
+                f"ID: {user_id}\n"
+                f"Username: {uname}\n"
+                f"Имя: {meta.get('name') or '-'}\n"
+                f"Товар: {mem.get('service') or '-'}\n"
                 f"Город: {mem.get('city') or '-'}\n"
                 f"Площадь: {mem.get('area_m2') or '-'}\n"
                 f"Адрес: {mem.get('address') or '-'}\n"
@@ -1004,8 +1235,68 @@ class AppState:
                 f"Ссылка: {link}\n"
                 f"Текст: {user_text}"
             )
+
+            # событие
+            try:
+                self.lead_events.append(
+                    {
+                        "ts": int(time.time()),
+                        "event": "hot_create",
+                        "lead_key": mem.get("hot_lead_key"),
+                        "platform": platform,
+                        "user_id": user_id,
+                        "snapshot": mem.get("hot_snapshot"),
+                    }
+                )
+            except Exception:
+                pass
+
+        # 2) Обновление: если "горячий" уже отправляли, но данные изменились — шлём дифф.
+        if mem.get("hot_notified"):
+            prev = mem.get("hot_snapshot") or {}
+            cur = _snapshot()
+            changed = {k: (prev.get(k), cur.get(k)) for k in cur.keys() if prev.get(k) != cur.get(k)}
+            # анти-спам: не чаще 1 раза в 20 секунд
+            last_u = float(mem.get("hot_update_ts") or 0)
+            if changed and (time.time() - last_u) > 20:
+                mem["hot_update_ts"] = time.time()
+                mem["hot_snapshot"] = cur
+
+                def _fmt(v):
+                    return "-" if v in (None, "", [], {}) else v
+
+                lines = []
+                for k2, (a, b) in changed.items():
+                    if k2 in ("username", "name"):
+                        continue
+                    lines.append(f"{k2}: {_fmt(a)} → {_fmt(b)}")
+
+                if lines:
+                    header = f"📝 Обновление лида ({_platform_label(platform)})"
+                    self.notify_now(
+                        f"{header}\n"
+                        f"ID: {user_id}\n"
+                        f"LeadKey: {mem.get('hot_lead_key') or _lead_key()}\n"
+                        + "\n".join(lines)
+                    )
+                    try:
+                        self.lead_events.append(
+                            {
+                                "ts": int(time.time()),
+                                "event": "hot_update",
+                                "lead_key": mem.get("hot_lead_key") or _lead_key(),
+                                "platform": platform,
+                                "user_id": user_id,
+                                "changed": changed,
+                            }
+                        )
+                    except Exception:
+                        pass
         # создаём тёплый лид, чтобы не терять обращения
         self._maybe_create_warm_lead(platform, user_id, mem, meta, user_text)
+
+        # если заявка уже была создана — отправляем обновление при изменениях (перенос времени/адреса и т.д.)
+        self._maybe_update_measure_lead(platform, user_id, mem, meta)
 
         # ---- unsupported city short-circuit ----
         if mem.get("unsupported_city_candidate") and not mem.get("city"):

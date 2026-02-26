@@ -115,7 +115,8 @@ class FewShotManager:
             return []
 
         mem = mem or {}
-        service_hint = "sound" if mem.get("soundproof_pending") else "ceiling"
+        service = mem.get("service") or ("soundproof" if mem.get("soundproof_pending") else "ceiling")
+        service_hint = "sound" if service == "soundproof" else "ceiling"
 
         q_tokens = _tokenize(user_text)
         scored: List[Tuple[float, FewShotExample]] = []

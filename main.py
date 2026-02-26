@@ -24,7 +24,7 @@ def log_task_result(t: asyncio.Task) -> None:
 async def main():
     load_dotenv()
 
-    model = os.getenv("OLLAMA_MODEL", "qwen2.5:7b")
+    model = os.getenv("OLLAMA_MODEL", "qwen2.5:3b")
     ollama_timeout = int(os.getenv("OLLAMA_TIMEOUT", "240") or "240")
     state = AppState(model=model, ollama_timeout=ollama_timeout)
 
@@ -38,19 +38,19 @@ async def main():
                 state=state,
                 bot_token=tg_token,
                 callcenter_chat_id=os.getenv("CALLCENTER_CHAT_ID", ""),
-                debounce_delay=float(os.getenv("TG_DEBOUNCE_DELAY", "1.2") or "1.2"),
+                debounce_delay=float(os.getenv("TG_DEBOUNCE_DELAY", "5") or "5"),
             ),
             name="telegram",
         )
         t.add_done_callback(log_task_result)
         tasks.append(t)
 
-    if os.getenv("ENABLE_AVITO", "0") == "0":
+    if os.getenv("ENABLE_AVITO", "0") == "1":
         t = asyncio.create_task(run_avito_poller(state), name="avito")
         t.add_done_callback(log_task_result)
         tasks.append(t)
 
-    if os.getenv("ENABLE_VK", "0") == "0":
+    if os.getenv("ENABLE_VK", "0") == "1":
         t = asyncio.create_task(run_vk(state), name="vk")
         t.add_done_callback(log_task_result)
         tasks.append(t)
@@ -58,10 +58,8 @@ async def main():
     if not tasks:
         raise RuntimeError("Ни один адаптер не включён. Поставь ENABLE_TG/ENABLE_AVITO/ENABLE_VK=1")
 
-    # ✅ важно: return_exceptions=True — чтобы одна упавшая таска не гробила остальные
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
-    # если что-то вернулось как исключение — напечатаем
     for r in results:
         if isinstance(r, Exception):
             print("[main] task exception:", repr(r))
