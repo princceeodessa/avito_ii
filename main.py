@@ -45,12 +45,12 @@ async def main():
         t.add_done_callback(log_task_result)
         tasks.append(t)
 
-    if os.getenv("ENABLE_AVITO", "0") == "1":
+    if os.getenv("ENABLE_AVITO", "0") == "0":
         t = asyncio.create_task(run_avito_poller(state), name="avito")
         t.add_done_callback(log_task_result)
         tasks.append(t)
 
-    if os.getenv("ENABLE_VK", "0") == "1":
+    if os.getenv("ENABLE_VK", "0") == "0":
         t = asyncio.create_task(run_vk(state), name="vk")
         t.add_done_callback(log_task_result)
         tasks.append(t)

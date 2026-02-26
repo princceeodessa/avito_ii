@@ -16,7 +16,7 @@ from core.memory_store import FileKVStore
 from core.fewshot import FewShotManager
 from core.pricing import PricingEngine
 from core.promotions import PromotionManager
-from core.response import OllamaClient
+from core.response import OllamaClient, LLMTimeoutError
 
 DEFAULT_SYSTEM_PROMPT = """Ты — Ульяна, менеджер по натяжным потолкам.
 Общайся по-русски.
@@ -100,10 +100,56 @@ def _norm_phrase(phrase: str) -> str:
 
 NORM_CITIES: List[Tuple[str, str]] = [(c, _norm_phrase(c)) for c in SUPPORTED_CITIES]
 
+# Short aliases users often type.
+# Important: we normalize latin look-alikes too (EKB, etc.).
+CITY_ALIASES: Dict[str, str] = {
+    # Екатеринбург
+    "екб": "Екатеринбург",
+    "екат": "Екатеринбург",
+    "ека": "Екатеринбург",
+    "ekb": "Екатеринбург",
+    # Ижевск
+    "иж": "Ижевск",
+    "izh": "Ижевск",
+}
+
+_LATIN_LOOKALIKES = str.maketrans({
+    # common latin → cyrillic look-alikes
+    "e": "е",
+    "k": "к",
+    "b": "в",
+    "a": "а",
+    "o": "о",
+    "p": "р",
+    "c": "с",
+    "x": "х",
+    "m": "м",
+    "t": "т",
+    "y": "у",
+    "h": "н",
+})
+
+
+def _norm_city_token(s: str) -> str:
+    s = (s or "").strip().lower().replace("ё", "е")
+    s = s.translate(_LATIN_LOOKALIKES)
+    s = re.sub(r"[^a-zа-я\-]+", "", s, flags=re.IGNORECASE)
+    return s
+
 def extract_city(text: str) -> Optional[str]:
     t = (text or "").strip()
     if not t:
         return None
+
+    # Alias hit (including inside phrases: "я из ижа", "в екб")
+    if CITY_ALIASES:
+        nt = _norm_city_token(t)
+        if nt in CITY_ALIASES:
+            return CITY_ALIASES[nt]
+        for tok in re.findall(r"[A-Za-zА-Яа-яЁё\-]{2,}", t):
+            nt = _norm_city_token(tok)
+            if nt in CITY_ALIASES:
+                return CITY_ALIASES[nt]
 
     # быстрый exact (с учётом регистра)
     for city in SUPPORTED_CITIES:
@@ -601,7 +647,7 @@ class AppState:
     Адаптеры (tg/avito/...) просто вызывают generate_reply().
     """
 
-    def __init__(self, model: str, ollama_timeout: int = 240):
+    def __init__(self, model: str, ollama_timeout: int = 60):
         # ВАЖНО: у systemd/cron рабочая директория часто не равна папке проекта.
         # Поэтому все относительные пути приводим к абсолютным относительно корня репозитория.
         self.base_dir = Path(__file__).resolve().parents[1]
@@ -1323,6 +1369,27 @@ class AppState:
             self.mem_store.save(k, mem)
             return ans
 
+        # ---- потолки: если уже есть город+площадь, не уводим в "анкету" — даём ориентир сразу ----
+        if (mem.get("service") or "ceiling") != "soundproof":
+            if mem.get("city") and mem.get("area_m2") and not mem.get("price_given"):
+                # если клиент прямо просит записать/"давайте" — пусть уходит в замер-ветку ниже
+                if not (detect_measurement_booking_intent(user_text) or detect_affirm(user_text)):
+                    est = self.pricing.estimate(service="ceiling", city=str(mem.get("city")), area_m2=float(mem.get("area_m2")))
+                    if est and est.min_price is not None:
+                        mem["price_given"] = True
+                        ans = (
+                            f"Ориентир по стоимости: от {int(est.min_price)} ₽ ✅\n"
+                            f"({mem.get('city')}, {int(float(mem.get('area_m2')))} м²)\n"
+                            "Точная цена зависит от углов, светильников и выбранного профиля/полотна.\n"
+                            "Хотите просто ориентир (без замера) или записать на бесплатный замер?"
+                        )
+                        ans = sanitize_answer(ans, allow_greet=greet)
+                        history.add_assistant(ans)
+                        self._push_dialog(mem, "assistant", ans)
+                        mem["_started"] = True
+                        self.mem_store.save(k, mem)
+                        return ans
+
         # ---- отдельный товар: шумо/звукоизоляция под ключ ----
         if mem.get("service") == "soundproof":
             # если клиент пишет про выезд — логистика уже отработана выше
@@ -1627,12 +1694,26 @@ class AppState:
 
         try:
             answer = self.ollama.chat(msgs)
-        except Exception as e:
-            err = str(e).lower()
-            if "timed out" in err or "timeout" in err:
-                answer = "Похоже, сервис сейчас занят 😕 Сообщение получил. Если ответа не будет — напишите «+»."
+        except LLMTimeoutError:
+            # Fast, UX-friendly fallback on LLM timeout.
+            # Prefer deterministic steps: price estimate / ask missing fields / handoff.
+            if mem.get("city") and mem.get("area_m2"):
+                est = self.pricing.estimate(service=service, city=mem.get("city"), area_m2=float(mem.get("area_m2")))
+                if est and est.min_price is not None:
+                    answer = (
+                        f"Ориентир по стоимости: от {int(est.min_price)} ₽ ✅\n"
+                        f"({mem.get('city')}, {int(float(mem.get('area_m2')))} м²)\n"
+                        "Если хотите — могу уточнить точнее по светильникам/карнизу."
+                    )
+                else:
+                    answer = "Подскажите, пожалуйста, площадь (м²) и город — и я дам ориентир по цене 🙂"
             else:
-                answer = f"Ошибка генерации ответа: {e}"
+                if not mem.get("city"):
+                    answer = build_need_city(first=greet)
+                else:
+                    answer = build_need_area(first=greet)
+        except Exception as e:
+            answer = "Сервис ответа сейчас перегружен 😕 Сообщение получил. Если ответа не будет — напишите «+»."
 
         answer = sanitize_answer(answer, allow_greet=greet)
         history.add_assistant(answer)
