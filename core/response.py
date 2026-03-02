@@ -37,7 +37,7 @@ class OllamaClient:
         self,
         base_url: Optional[str] = None,
         model: str = "qwen2.5:3b",
-        timeout: int = 60,
+        timeout: int = 45,
         request_timeout: Optional[int] = None,
     ):
         self.base_url = (base_url or os.getenv("OLLAMA_URL", "http://localhost:11434")).rstrip("/")
@@ -49,7 +49,7 @@ class OllamaClient:
 
         # Defaults tuned for chat UX.
         default_ct = float(os.getenv("OLLAMA_CONNECT_TIMEOUT", "5"))
-        default_rt = float(os.getenv("OLLAMA_READ_TIMEOUT", "60"))
+        default_rt = float(os.getenv("OLLAMA_READ_TIMEOUT", "45"))
 
         ct = os.getenv("OLLAMA_CONNECT_TIMEOUT")
         rt = os.getenv("OLLAMA_READ_TIMEOUT")

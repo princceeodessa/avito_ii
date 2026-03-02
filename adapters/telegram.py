@@ -58,10 +58,22 @@ class DebouncedReply:
                 meta=meta,
             )
         except Exception as e:
-            # чтобы TG не молчал при падении LLM
+            # Не молчим при падении логики/LLM: создаём лид в поддержку и отвечаем пользователю.
+            try:
+                self.state.create_support_request(
+                    platform=self.platform,
+                    user_id=str(uid),
+                    user_text=user_text,
+                    meta=meta,
+                    reason="tg_generate_reply_exception",
+                    error=str(e),
+                )
+            except Exception:
+                pass
+
             await self.bot.send_message(
                 chat_id=message.chat.id,
-                text="Сервис ответа сейчас занят 😕 Сообщение получил. Если ответа не будет — напишите «+».",
+                text="Сервис ответа сейчас занят 😕 Я передала запрос менеджеру — он подключится. Если ответа не будет — напишите «+».",
             )
             print(f"[tg] generate_reply error: {e}")
             return
@@ -139,7 +151,14 @@ async def run_telegram(
     async def cmd_reset(message: Message):
         if not message.from_user:
             return
-        state.reset_all(platform="tg", user_id=str(message.from_user.id))
+        uid = str(message.from_user.id)
+        # If user resets after troubles, optionally notify support (off by default)
+        try:
+            if os.getenv("TG_RESET_SUPPORT", "0") == "1":
+                state.create_support_request(platform="tg", user_id=uid, user_text="/reset", meta={"username": (message.from_user.username or ""), "name": (message.from_user.full_name or "")}, reason="user_reset")
+        except Exception:
+            pass
+        state.reset_all(platform="tg", user_id=uid)
         await message.answer("Ок, историю и данные сбросил. Напишите новый запрос 🙂")
 
     @router.message(F.text)

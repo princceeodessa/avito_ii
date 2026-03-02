@@ -113,13 +113,28 @@ class DebouncedReply:
         user_text = "\n".join(parts).strip()
 
         # generate_reply может блокировать (LLM/requests) — уводим в thread
-        reply = await asyncio.to_thread(
-            self.state.generate_reply,
-            "vk",
-            str(user_id),
-            user_text,
-            meta,
-        )
+        try:
+            reply = await asyncio.to_thread(
+                self.state.generate_reply,
+                "vk",
+                str(user_id),
+                user_text,
+                meta,
+            )
+        except Exception as e:
+            try:
+                self.state.create_support_request(
+                    platform="vk",
+                    user_id=str(user_id),
+                    user_text=user_text,
+                    meta=meta,
+                    reason="vk_generate_reply_exception",
+                    error=str(e),
+                )
+            except Exception:
+                pass
+            await vk_send_message(session, token, peer_id, "Сервис ответа сейчас занят 😕 Я передала запрос менеджеру — он подключится. Если ответа не будет — напишите «+».")
+            return
 
         if reply:
             reply = reply.replace("__PROMO_IMAGE__\n", "")
