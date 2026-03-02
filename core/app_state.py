@@ -17,7 +17,6 @@ from core.fewshot import FewShotManager
 from core.pricing import PricingEngine
 from core.promotions import PromotionManager
 from core.response import OllamaClient, LLMTimeoutError
-from core.knowledge_base import KnowledgeBase
 
 DEFAULT_SYSTEM_PROMPT = """Ты — Ульяна, менеджер по натяжным потолкам.
 Общайся по-русски.
@@ -152,6 +151,18 @@ def extract_city(text: str) -> Optional[str]:
             if nt in CITY_ALIASES:
                 return CITY_ALIASES[nt]
 
+    # Token-level stem match ("из ижевска" -> token "ижевска" -> stem "ижевск")
+    try:
+        for tok in re.findall(r"[A-Za-zА-Яа-яЁё\-]{3,}", t):
+            st = _stem_ru_word(tok)
+            if not st:
+                continue
+            for city, ncity in NORM_CITIES:
+                if st == ncity:
+                    return city
+    except Exception:
+        pass
+
     # быстрый exact (с учётом регистра)
     for city in SUPPORTED_CITIES:
         if re.search(rf"\b{re.escape(city)}\b", t, flags=re.IGNORECASE):
@@ -161,15 +172,6 @@ def extract_city(text: str) -> Optional[str]:
     norm_text = _norm_phrase(t)
     if not norm_text:
         return None
-
-    # Fast token-based match (handles 'из ижевска', 'в екатеринбурге' etc.)
-    token_set = set(norm_text.split())
-    for city, ncity in NORM_CITIES:
-        if not ncity:
-            continue
-        n_tokens = ncity.split()
-        if n_tokens and set(n_tokens).issubset(token_set):
-            return city
 
     best_city = None
     best_score = 0.0
@@ -237,8 +239,6 @@ QUESTION_MATERIALS_RE = re.compile(
 THANKS_CHEAP_RE = re.compile(r"\b(спасибо|понял(а)?|ок)\b", re.IGNORECASE)
 
 GOODBYE_RE = re.compile(r"\b(пока|до\s+свидания|всего\s+доброго|хорошего\s+дня|до\s+связи)\b", re.IGNORECASE)
-
-UNCERTAIN_RE = re.compile(r"\b(не\s*знаю|не\s*уверен|не\s*уверена|нет\s+информац|не\s*располагаю\s+информац|сложно\s+сказать|нужно\s+уточнить\s+у\s+менеджера)\b", re.IGNORECASE)
 
 def detect_materials_question(text: str) -> bool:
     return bool(QUESTION_MATERIALS_RE.search(text or ""))
@@ -576,9 +576,10 @@ def build_estimate(min_price: int, city: str, area_m2: float, ask_measure: bool)
         + ("\nЗаписать вас на замер?" if ask_measure else "")
     )
     return (
-        f"Ориентир по стоимости: от {min_price} ₽ ✅\n"
+        f"Ориентир за потолок (по площади): от {min_price} ₽ ✅\n"
         f"({city}, {area_m2:g} м²)\n"
-        "Точная цена зависит от углов, светильников и выбранного профиля/материала.\n"
+        "Важно: доп.работы (люстры/светильники/карнизы/ниши/углы/профиль и т.д.) в ориентир НЕ включены — точная стоимость уточняется на замере.\n"
+        "Минимальная стоимость заказа — от 8 000 ₽.\n"
         f"{tail}"
     )
 
@@ -659,7 +660,7 @@ class AppState:
     Адаптеры (tg/avito/...) просто вызывают generate_reply().
     """
 
-    def __init__(self, model: str, ollama_timeout: int = 45):
+    def __init__(self, model: str, ollama_timeout: int = 60):
         # ВАЖНО: у systemd/cron рабочая директория часто не равна папке проекта.
         # Поэтому все относительные пути приводим к абсолютным относительно корня репозитория.
         self.base_dir = Path(__file__).resolve().parents[1]
@@ -723,6 +724,107 @@ class AppState:
             asyncio.create_task(self._notify_coro(text))
 
         self._loop.call_soon_threadsafe(_schedule)
+
+    # ---------- support / handoff on failures ----------
+    def create_support_request(
+        self,
+        platform: str,
+        user_id: str,
+        meta: Optional[Dict[str, Any]],
+        mem: Optional[Dict[str, Any]],
+        user_text: str,
+        error: str = "",
+        reason: str = "exception",
+    ) -> None:
+        """Creates a support lead and notifies callcenter.
+
+        Used when the bot can't reply (timeouts/exceptions) so we don't lose the client.
+        """
+        meta = meta or {}
+        mem = mem or {}
+
+        # anti-spam: at most one support ping per chat in 3 minutes
+        try:
+            last_ts = float(mem.get("_support_last_ts") or 0)
+            if time.time() - last_ts < 180:
+                return
+            mem["_support_last_ts"] = time.time()
+            self.mem_store.save(self._key(platform, user_id), mem)
+        except Exception:
+            pass
+
+        lead_key = f"{platform}:{user_id}:{mem.get('service') or 'unknown'}"
+
+        # collect last turns
+        dialog = mem.get("_dialog") if isinstance(mem.get("_dialog"), list) else []
+        tail = []
+        for it in dialog[-6:]:
+            if isinstance(it, dict) and isinstance(it.get("text"), str) and isinstance(it.get("role"), str):
+                role = "Клиент" if it["role"] == "user" else "Менеджер"
+                tail.append(f"{role}: {it['text']}")
+
+        lead = {
+            "ts": int(time.time()),
+            "platform": platform,
+            "user_id": user_id,
+            "username": meta.get("username") or "",
+            "name": meta.get("name") or "",
+            "lead_kind": "support_request",
+            "reason": reason,
+            "error": (error or "")[:500],
+            "service": mem.get("service"),
+            "city": mem.get("city"),
+            "area_m2": mem.get("area_m2"),
+            "extras": mem.get("extras"),
+            "address": mem.get("address"),
+            "visit_date": mem.get("visit_date"),
+            "visit_time": mem.get("visit_time"),
+            "phone": mem.get("phone"),
+            "text": user_text,
+            "lead_key": lead_key,
+            "dialog_tail": tail,
+        }
+
+        try:
+            self.leads.append(lead)
+        except Exception:
+            pass
+
+        try:
+            self.lead_events.append(
+                {
+                    "ts": int(time.time()),
+                    "event": "support_request",
+                    "lead_key": lead_key,
+                    "platform": platform,
+                    "user_id": user_id,
+                    "reason": reason,
+                    "text": user_text,
+                }
+            )
+        except Exception:
+            pass
+
+        # notify callcenter
+        try:
+            uname = f"@{meta.get('username')}" if meta.get("username") else "-"
+            link = meta.get("chat_url") or meta.get("item_url") or meta.get("link") or "-"
+            self.notify_now(
+                "🆘 Нужна помощь менеджера\n"
+                f"Платформа: {platform}\n"
+                f"ID: {user_id}\n"
+                f"Username: {uname}\n"
+                f"Имя: {meta.get('name') or '-'}\n"
+                f"Товар: {mem.get('service') or '-'}\n"
+                f"Город: {mem.get('city') or '-'}\n"
+                f"Площадь: {mem.get('area_m2') or '-'}\n"
+                f"Телефон: {mem.get('phone') or '-'}\n"
+                f"Ссылка: {link}\n"
+                f"Текст: {user_text}\n"
+                + ("\n".join(tail) if tail else "")
+            )
+        except Exception:
+            pass
 
     # ---------- email sender ----------
     def set_email_sender(self, loop, email_sender: EmailSender) -> None:
@@ -1057,124 +1159,6 @@ class AppState:
 
 
     # ---------- public API ----------
-
-    def create_support_request(
-        self,
-        platform: str,
-        user_id: str,
-        user_text: str,
-        meta: Optional[Dict[str, Any]] = None,
-        mem: Optional[Dict[str, Any]] = None,
-        reason: str = "needs_help",
-        error: str = "",
-    ) -> None:
-        """Create a support lead and notify the callcenter.
-
-        Use this when:
-        - LLM/logic crashed ("service busy")
-        - user asks to connect a human / operator
-        - question is important and we are not confident to answer
-        """
-        try:
-            platform = (platform or "").strip() or "unknown"
-            user_id = str(user_id or "").strip() or "unknown"
-            meta = meta or {}
-            # Load mem if not provided (adapters may call us on exceptions)
-            if mem is None:
-                k = f"{platform}:{user_id}"
-                mem = self.mem_store.load(k) or {}
-            else:
-                mem = mem or {}
-
-            # anti-spam: at most once per 10 minutes per same reason
-            now = time.time()
-            last_ts = float(mem.get("_support_ts") or 0)
-            last_reason = str(mem.get("_support_reason") or "")
-            if last_ts and (now - last_ts) < 600 and (not reason or reason == last_reason):
-                return
-
-            mem["_support_ts"] = now
-            mem["_support_reason"] = reason
-
-            service = mem.get("service") or ("soundproof" if mem.get("soundproof_pending") else "ceiling")
-            uname = meta.get("username") or mem.get("username") or ""
-            name = meta.get("name") or mem.get("name") or ""
-
-            # last dialog snapshot (for manager)
-            dialog = mem.get("_dialog") if isinstance(mem.get("_dialog"), list) else []
-            tail = []
-            for it in dialog[-8:]:
-                if isinstance(it, dict) and isinstance(it.get("role"), str) and isinstance(it.get("text"), str):
-                    role = "Клиент" if it["role"] == "user" else "Менеджер"
-                    tail.append(f"{role}: {it['text']}")
-            if user_text and (not tail or (tail and (tail[-1] != user_text))):
-                tail.append(f"Клиент: {user_text}")
-
-            lead = {
-                "ts": int(now),
-                "platform": platform,
-                "user_id": user_id,
-                "username": uname,
-                "name": name,
-                "lead_kind": "support_request",
-                "service": service,
-                "city": mem.get("city"),
-                "area_m2": mem.get("area_m2"),
-                "extras": mem.get("extras"),
-                "address": mem.get("address"),
-                "visit_date": resolve_relative_date(mem.get("visit_date") or ""),
-                "visit_time": mem.get("visit_time"),
-                "phone": mem.get("phone") if not mem.get("no_phone") else None,
-                "reason": reason,
-                "error": (error or "")[:800],
-                "last_messages": tail,
-                "meta": meta,
-            }
-            self.leads.append(lead)
-
-            try:
-                self.lead_events.append(
-                    {
-                        "ts": int(now),
-                        "event": "support_request",
-                        "lead_key": f"{platform}:{user_id}:support",
-                        "platform": platform,
-                        "user_id": user_id,
-                        "reason": reason,
-                        "error": (error or "")[:800],
-                    }
-                )
-            except Exception:
-                pass
-
-            # notify callcenter
-            uname_line = f"@{uname}" if uname else "-"
-            header = f"🆘 Нужна помощь ({platform})"
-            text = (
-                f"{header}\n"
-                f"User ID: {user_id}\n"
-                f"Username: {uname_line}\n"
-                f"Имя: {name or '-'}\n"
-                f"Товар: {service}\n"
-                f"Город: {mem.get('city') or '-'}\n"
-                f"Площадь: {mem.get('area_m2') or '-'}\n"
-                f"Причина: {reason}\n"
-            )
-            if error:
-                text += f"Ошибка: {error[:200]}\n"
-            if tail:
-                text += "\nПоследние сообщения:\n" + "\n".join(tail[-8:])
-            self.notify_now(text)
-
-            # persist updated mem if we loaded it here
-            try:
-                k = f"{platform}:{user_id}"
-                self.mem_store.save(k, mem)
-            except Exception:
-                pass
-        except Exception:
-            return
-
     def generate_reply(
         self,
         platform: str,
@@ -1266,8 +1250,16 @@ class AppState:
         self._push_dialog(mem, "user", user_text)
         history.add_user(user_text)
 
-        # greeting-only: если клиент просто поздоровался/просит приветствие — отвечаем приветствием и коротким вопросом
-        if wants_greet and not mem.get("city") and not mem.get("area_m2"):
+        # greeting-only: отвечаем приветствием ТОЛЬКО если это реально короткое приветствие.
+        # Иначе (как в кейсе: "Добрый день! Нужно потолок... 11 квадратов...") мы обязаны распарсить сообщение.
+        is_pure_greeting = (
+            bool(wants_greet)
+            and len((user_text or "").strip().split()) <= 3
+            and not re.search(r"\d", user_text or "")
+            and not re.search(r"\b(потолк|натяж|шумо|звуко|изоляц|цена|стоим|сколько)\b", user_text or "", re.IGNORECASE)
+        )
+
+        if is_pure_greeting and not mem.get("city") and not mem.get("area_m2"):
             ans = sanitize_answer(build_welcome(first=True), allow_greet=True)
             history.add_assistant(ans)
             self._push_dialog(mem, "assistant", ans)
@@ -1287,10 +1279,77 @@ class AppState:
 
         # ---- извлечение площади/допов ----
         extracted = extract_info(user_text)
+
+        # площадь
         if getattr(extracted, "area_m2", None):
             mem["area_m2"] = extracted.area_m2
+
+        # допы: сохраняем и накапливаем (часто клиент пишет допы в 2-3 сообщения)
+        prev_extras = mem.get("extras") if isinstance(mem.get("extras"), list) else []
+        prev_counts = mem.get("extras_counts") if isinstance(mem.get("extras_counts"), dict) else {}
+
+        # количества по допам (если клиент указал явно — обновляем)
+        if getattr(extracted, "extras_counts", None):
+            try:
+                new_counts = dict(prev_counts)
+                for kx, vx in (extracted.extras_counts or {}).items():
+                    # явное количество из последнего сообщения приоритетнее
+                    new_counts[str(kx)] = int(vx)
+                mem["extras_counts"] = new_counts
+            except Exception:
+                pass
+
+        # признаки допов (без количеств) — мерджим, не затираем
         if getattr(extracted, "extras", None):
-            mem["extras"] = extracted.extras
+            try:
+                merged = list(prev_extras)
+                for e in (extracted.extras or []):
+                    if e not in merged:
+                        merged.append(e)
+                mem["extras"] = merged
+            except Exception:
+                pass
+
+        # углы/профиль — полезно для контекста (даже если в pricing_rules пока не учтены)
+        try:
+            low = (user_text or "").lower().replace("ё", "е")
+            m_ang = re.search(r"\b(\d{1,2})\s*(угл\w*)\b", low)
+            if m_ang:
+                mem["angles"] = int(m_ang.group(1))
+        except Exception:
+            pass
+
+        try:
+            low = (user_text or "").lower().replace("ё", "е")
+            if re.search(r"\bне\s+парящ", low):
+                mem["profile"] = "standard"
+            elif re.search(r"\bпарящ", low):
+                mem["profile"] = "floating"
+        except Exception:
+            pass
+
+        def _extras_for_pricing() -> List[str]:
+            out: List[str] = []
+            counts = mem.get("extras_counts") if isinstance(mem.get("extras_counts"), dict) else {}
+            # counts first (so they can multiply)
+            for name, cnt in (counts or {}).items():
+                try:
+                    n = int(cnt)
+                except Exception:
+                    continue
+                if n <= 0:
+                    continue
+                # защита от огромных чисел
+                if n > 60:
+                    n = 60
+                out.extend([str(name)] * n)
+
+            extras_list = mem.get("extras") if isinstance(mem.get("extras"), list) else []
+            for e in extras_list:
+                if isinstance(counts, dict) and e in counts:
+                    continue
+                out.append(e)
+            return out
 
         # эвристика площади: ловим число даже без "кв.м"
         # ВАЖНО: не подменяем "3 потолка/3 комнаты" на "3 м²" — это ломает диалог.
@@ -1504,13 +1563,14 @@ class AppState:
             if mem.get("city") and mem.get("area_m2") and not mem.get("price_given"):
                 # если клиент прямо просит записать/"давайте" — пусть уходит в замер-ветку ниже
                 if not (detect_measurement_booking_intent(user_text) or detect_affirm(user_text)):
-                    est = self.pricing.calculate(str(mem.get("city")), float(mem.get("area_m2")), list(mem.get("extras") or []))
-                    if est and est.min_price is not None:
+                    est = self.pricing.calculate(city=str(mem.get("city")), area_m2=float(mem.get("area_m2")), extras=_extras_for_pricing())
+                    if getattr(est, "min_price", None) is not None:
                         mem["price_given"] = True
                         ans = (
-                            f"Ориентир по стоимости: от {int(est.min_price)} ₽ ✅\n"
+                            f"Ориентир за потолок (по площади): от {int(est.min_price)} ₽ ✅\n"
                             f"({mem.get('city')}, {int(float(mem.get('area_m2')))} м²)\n"
-                            "Точная цена зависит от углов, светильников и выбранного профиля/полотна.\n"
+                            "Важно: доп.работы (люстры/светильники/карнизы/ниши/углы/профиль и т.д.) в ориентир НЕ включены — точная стоимость уточняется на замере.\n"
+                            "Минимальная стоимость заказа — от 8 000 ₽.\n"
                             "Хотите просто ориентир (без замера) или записать на бесплатный замер?"
                         )
                         ans = sanitize_answer(ans, allow_greet=greet)
@@ -1625,7 +1685,19 @@ class AppState:
             return msg
 
         # ---- намерения ----
-        price_q = detect_price_question(user_text) or bool(mem.get("calc_only"))
+        # если клиент уточняет допы (люстры/карниз/углы/профиль и т.п.),
+        # обычно он ждёт пересчёт — даже если не написал слово "цена".
+        low_now = (user_text or "").lower().replace("ё", "е")
+        spec_update = bool(
+            (getattr(extracted, "extras_counts", None) and extracted.extras_counts)
+            or (getattr(extracted, "extras", None) and extracted.extras)
+            or re.search(r"\bугл\w*\b", low_now)
+            or re.search(r"\bпарящ\w*\b", low_now)
+            or re.search(r"\bплинтус\w*\b", low_now)
+            or re.search(r"\bподсвет\w*\b", low_now)
+        )
+
+        price_q = detect_price_question(user_text) or bool(mem.get("calc_only")) or (spec_update and bool(mem.get("city") and mem.get("area_m2")))
         book_measure = detect_measurement_booking_intent(user_text)
         info_measure = detect_measurement_info_question(user_text)
 
@@ -1681,11 +1753,7 @@ class AppState:
                 return ans
 
             # 2) считаем ориентир
-            estimate = self.pricing.calculate(
-                city=mem.get("city"),
-                area_m2=mem.get("area_m2"),
-                extras=mem.get("extras") or [],
-            )
+            estimate = self.pricing.calculate(city=mem.get("city"), area_m2=mem.get("area_m2"), extras=_extras_for_pricing())
             if getattr(estimate, "min_price", None) is None:
                 mem["asked_area"] = True
                 ans = sanitize_answer(build_need_area(greet, mem["city"]), allow_greet=greet)
@@ -1701,7 +1769,28 @@ class AppState:
 
             # 3) если уже недавно давали такой же прайс — не повторяем прайс, а ведём диалог дальше
             if _is_duplicate_estimate(mem, sig):
-                if detect_materials_question(user_text):
+                # Но если клиент только что уточнил допы — лучше вежливо подтвердить,
+                # даже если сумма не изменилась.
+                if spec_update:
+                    prefix_lines = []
+                    counts = mem.get("extras_counts") if isinstance(mem.get("extras_counts"), dict) else {}
+                    if counts.get("люстра"):
+                        prefix_lines.append(f"Люстры: {int(counts['люстра'])} шт.")
+                    if counts.get("светильник"):
+                        prefix_lines.append(f"Светильники: {int(counts['светильник'])} шт.")
+                    if counts.get("карниз"):
+                        prefix_lines.append(f"Карниз: ~{int(counts['карниз'])} м")
+                    if mem.get("angles"):
+                        prefix_lines.append(f"Углы: {mem.get('angles')}")
+                    if mem.get("profile") == "floating":
+                        prefix_lines.append("Профиль: парящий")
+                    elif mem.get("profile") == "standard":
+                        prefix_lines.append("Профиль: обычный")
+
+                    ask_measure = not bool(mem.get("calc_only"))
+                    base_msg = build_estimate(minp, city=str(mem["city"]), area_m2=float(mem["area_m2"]), ask_measure=ask_measure)
+                    ans = "Поняла, учла ✅\n" + ("\n".join(prefix_lines) + "\n\n" if prefix_lines else "") + base_msg
+                elif detect_materials_question(user_text):
                     ans = build_materials_vs_turnkey(greet)
                 elif "дорог" in (user_text or "").lower():
                     ans = (
@@ -1715,7 +1804,7 @@ class AppState:
                 else:
                     ans = (
                         f"{t_hello(first)}Поняла 😊\n"
-                        "Если нужно — уточните допы (светильники/карниз/трубы), и я скорректирую ориентир.\n"
+                        "Если нужно — уточните допы (светильники/карниз/трубы), чтобы менеджеру было проще на замере.\n"
                         "Либо могу записать на бесплатный замер."
                     )
             else:
@@ -1723,7 +1812,28 @@ class AppState:
                 # после расчёта — предлагаем замер, но если клиент явно "без замера" — не давим
                 ask_measure = not bool(mem.get("calc_only"))
                 mem["measure_offer_pending"] = True
-                ans = build_estimate(minp, city=str(mem["city"]), area_m2=float(mem["area_m2"]), ask_measure=ask_measure)
+
+                prefix_lines = []
+                # красиво подхватываем уточнения клиента (чтобы не казалось, что "инфа потерялась")
+                counts = mem.get("extras_counts") if isinstance(mem.get("extras_counts"), dict) else {}
+                if counts.get("люстра"):
+                    prefix_lines.append(f"Люстры: {int(counts['люстра'])} шт.")
+                if counts.get("светильник"):
+                    prefix_lines.append(f"Светильники: {int(counts['светильник'])} шт.")
+                if counts.get("карниз"):
+                    prefix_lines.append(f"Карниз: ~{int(counts['карниз'])} м")
+                if mem.get("angles"):
+                    prefix_lines.append(f"Углы: {mem.get('angles')}")
+                if mem.get("profile") == "floating":
+                    prefix_lines.append("Профиль: парящий")
+                elif mem.get("profile") == "standard":
+                    prefix_lines.append("Профиль: обычный")
+
+                base_msg = build_estimate(minp, city=str(mem["city"]), area_m2=float(mem["area_m2"]), ask_measure=ask_measure)
+                if spec_update and prefix_lines:
+                    ans = "Поняла, учла допы ✅\n" + "\n".join(prefix_lines) + "\n\n" + base_msg
+                else:
+                    ans = base_msg
 
             ans = sanitize_answer(ans, allow_greet=greet)
             history.add_assistant(ans)
@@ -1777,37 +1887,12 @@ class AppState:
             return ans
 
         # ------------------- 5) fallback LLM (но с контекстом переписки) -------------------
-        service = mem.get("service") or ("soundproof" if mem.get("soundproof_pending") else "ceiling")
         city = mem.get("city")
         promo = self.promos.get_promo(city) if city else ""
 
         estimate = None
         if city and mem.get("area_m2"):
-            if service == "soundproof":
-                estimate = None
-            else:
-                estimate = self.pricing.calculate(city=city, area_m2=mem.get("area_m2"), extras=mem.get("extras") or [])
-
-        # Lightweight knowledge base (FAQ) — adds context and decides if we need a human.
-        kb_hits = self.kb.select(user_text=user_text, service=service, k=2)
-        if kb_hits and any(getattr(h, "escalate", False) for h in kb_hits):
-            # Important / ambiguous topic: create support request and answer safely.
-            top = kb_hits[0]
-            self.create_support_request(
-                platform=platform,
-                user_id=user_id,
-                user_text=user_text,
-                meta=meta,
-                mem=mem,
-                reason=f"kb_escalate:{getattr(top, 'id', 'topic')}",
-                error="",
-            )
-            ans = sanitize_answer(str(getattr(top, "answer", "")) or "Поняла вопрос. Подключаю менеджера ✅", allow_greet=greet)
-            history.add_assistant(ans)
-            self._push_dialog(mem, "assistant", ans)
-            mem["_started"] = True
-            self.mem_store.save(k, mem)
-            return ans
+            estimate = self.pricing.calculate(city=city, area_m2=mem.get("area_m2"), extras=_extras_for_pricing())
 
         context_parts = []
         if city:
@@ -1820,11 +1905,6 @@ class AppState:
             context_parts.append(f"Оценка: от {estimate.min_price} ₽ (ориентир, не точная цена)")
         if promo:
             context_parts.append(f"Акция: {promo}")
-
-        if kb_hits:
-            kb_text = "\n".join([f"- {h.answer}" for h in kb_hits if getattr(h, "answer", "")])
-            if kb_text.strip():
-                context_parts.append("Справка (FAQ):\n" + kb_text)
 
         # важное: добавим последние сообщения переписки (чтобы не переспрашивал)
         dialog = mem.get("_dialog") if isinstance(mem.get("_dialog"), list) else []
@@ -1855,96 +1935,34 @@ class AppState:
         try:
             answer = self.ollama.chat(msgs)
         except LLMTimeoutError:
-            # Fast, UX-friendly fallback on LLM timeout.
-            # If this repeats, we also notify a human.
-            try:
-                now = time.time()
-                last_ts = float(mem.get("_llm_timeout_ts") or 0)
-                cnt = int(mem.get("_llm_timeout_count") or 0)
-                if last_ts and (now - last_ts) < 600:
-                    cnt += 1
-                else:
-                    cnt = 1
-                mem["_llm_timeout_ts"] = now
-                mem["_llm_timeout_count"] = cnt
-                if cnt >= 2:
-                    self.create_support_request(
-                        platform=platform,
-                        user_id=user_id,
-                        user_text=user_text,
-                        meta=meta,
-                        mem=mem,
-                        reason="llm_timeout",
-                        error="",
-                    )
-            except Exception:
-                pass
-            # Prefer deterministic steps: price estimate / ask missing fields / handoff.
-            # Prefer deterministic steps: price estimate / ask missing fields / handoff.
-            if mem.get("city") and mem.get("area_m2"):
-                if service == "soundproof":
-                    answer = build_soundproofing_estimate(greet, str(mem.get("city")), float(mem.get("area_m2")))
-                else:
-                    est = self.pricing.calculate(str(mem.get("city")), float(mem.get("area_m2")), list(mem.get("extras") or []))
-                    if est and est.min_price is not None:
-                        answer = (
-                            f"Ориентир по стоимости: от {int(est.min_price)} ₽ ✅\n"
-                            f"({mem.get('city')}, {int(float(mem.get('area_m2')))} м²)\n"
-                            "Если хотите — могу уточнить точнее по светильникам/карнизу."
-                        )
-                    else:
-                        answer = "Подскажите, пожалуйста, площадь (м²) и город — и я дам ориентир по цене 🙂"
-            else:
-                if not mem.get("city"):
-                    answer = build_need_city(first=greet)
-                else:
-                    answer = build_need_area(first=greet)
-        except Exception as e:
-            # Unexpected error: create support request and respond with a safe fallback.
-            self.create_support_request(
-                platform=platform,
-                user_id=user_id,
-                user_text=user_text,
-                meta=meta,
-                mem=mem,
-                reason="runtime_error",
-                error=str(e),
-            )
-            if mem.get("city") and mem.get("area_m2"):
-                if service == "soundproof":
-                    answer = build_soundproofing_estimate(greet, str(mem.get("city")), float(mem.get("area_m2")))
-                else:
-                    est = self.pricing.calculate(str(mem.get("city")), float(mem.get("area_m2")), list(mem.get("extras") or []))
-                    if est and est.min_price is not None:
-                        answer = (
-                            f"Ориентир по стоимости: от {int(est.min_price)} ₽ ✅\n"
-                            f"({mem.get('city')}, {int(float(mem.get('area_m2')))} м²)\n"
-                            "Если хотите — могу уточнить точнее по светильникам/карнизу."
-                        )
-                    else:
-                        answer = "Подскажите, пожалуйста, площадь (м²) и город — и я дам ориентир по цене 🙂"
-            else:
-                if not mem.get("city"):
-                    answer = build_need_city(first=greet)
-                else:
-                    answer = build_need_area(first=greet)
-            # Let user know a human is on it (without sounding scary)
-            answer = (answer.strip() + "\n\nЯ передала запрос менеджеру — он подключится и поможет ✅").strip()
+            # UX-friendly fallback on LLM timeout.
+            # Важно: НЕ падать (никаких неопределённых переменных / несуществующих методов).
+            service_now = mem.get("service") or ("soundproof" if mem.get("soundproof_pending") else "ceiling")
 
-        # If the assistant sounds uncertain on an important question — escalate.
-        try:
-            if UNCERTAIN_RE.search(answer or ""):
-                self.create_support_request(
-                    platform=platform,
-                    user_id=user_id,
-                    user_text=user_text,
-                    meta=meta,
-                    mem=mem,
-                    reason="llm_uncertain",
-                    error="",
-                )
-        except Exception:
-            pass
+            if service_now == "soundproof":
+                if mem.get("city") and mem.get("area_m2"):
+                    answer = build_soundproofing_estimate(greet, str(mem.get("city")), float(mem.get("area_m2")))
+                elif not mem.get("city"):
+                    answer = build_soundproofing_need_city(greet)
+                else:
+                    answer = build_soundproofing_need_area(greet, str(mem.get("city")))
+            else:
+                if mem.get("city") and mem.get("area_m2"):
+                    est2 = self.pricing.calculate(city=str(mem.get("city")), area_m2=float(mem.get("area_m2")), extras=_extras_for_pricing())
+                    if getattr(est2, "min_price", None) is not None:
+                        answer = (
+                            f"Ориентир по стоимости: от {int(est2.min_price)} ₽ ✅\n"
+                            f"({mem.get('city')}, {int(float(mem.get('area_m2')))} м²)\n"
+                            "Если хотите — уточните допы (светильники/люстры/карниз), и я учту в заявке (точную стоимость уточним на замере)."
+                        )
+                    else:
+                        answer = build_need_area(greet, str(mem.get("city")))
+                elif not mem.get("city"):
+                    answer = build_need_city(greet)
+                else:
+                    answer = build_need_area(greet, str(mem.get("city")))
+        except Exception as e:
+            answer = "Сервис ответа сейчас перегружен 😕 Сообщение получил. Если ответа не будет — напишите «+»."
 
         answer = sanitize_answer(answer, allow_greet=greet)
         history.add_assistant(answer)

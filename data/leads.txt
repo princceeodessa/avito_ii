@@ -24,3 +24,4 @@
 [2026-02-25 22:36:19] platform=tg user_id=838744071 username=princeodessa name=Тёма lead_kind=measure service=ceiling city=Екатеринбург area_m2=24.0 extras=None visit_date=26.02.2026 visit_time=14:00 address=улица союзная 27а , 191 квартира phone=+79120204900
 [2026-02-26 01:49:18] platform=tg user_id=838744071 username=princeodessa name=Тёма lead_kind=warm service=ceiling city=Ижевск area_m2=24.0 extras=None visit_date= visit_time=None address=иж 24кв phone=None
 [2026-02-26 01:50:47] platform=tg user_id=838744071 username=princeodessa name=Тёма lead_kind=measure service=ceiling city=Ижевск area_m2=24.0 extras=None visit_date=27.02.2026 visit_time=14:00 address=после 2 phone=+79120204900
+[2026-03-02 10:33:01] platform=tg user_id=726926398 username=ulyanagrd name=Ulyana lead_kind=support_request service=ceiling city=Ижевск area_m2=11.0 extras=None visit_date= visit_time=None address=None phone=None
